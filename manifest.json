@@ -1,0 +1,20 @@
+{
+  "name": "openclaw-maintainer-skills",
+  "version": "0.1.0",
+  "conformance_version": "1.0.0",
+  "description": "OpenClaw-flavored maintainer skills: per-repo gh-triage + multi-repo repo-orchestrator. Adapted from steipete/agent-scripts for the OpenClaw agent runtime.",
+  "homepage": "https://github.com/alfredjbclaw/openclaw-maintainer-skills",
+  "license": "MIT",
+  "skills": [
+    {
+      "name": "gh-triage",
+      "path": "skills/gh-triage/SKILL.md",
+      "description": "Use whenever the user types triage or asks to triage GitHub issues, PRs, queues, CI, blockers, risk, proof, or next actions. Per-repo by default; broad cross-owner mode on request."
+    },
+    {
+      "name": "repo-orchestrator",
+      "path": "skills/repo-orchestrator/SKILL.md",
+      "description": "Orchestrate delegated maintainer work across a fleet of GitHub repositories: prepare decision-ready PRs through OpenClaw subagent workers, monitor progress on an interval, ask the owner only at decision boundaries, and execute authorized releases."
+    }
+  ]
+}
