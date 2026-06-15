@@ -1,0 +1,77 @@
+# pincer configuration
+#
+# Copy this to ~/.openclaw/pincer.toml and edit. The keeper meta-runner reads
+# from ~/.openclaw/pincer.toml by default; override with $PINCER_CONFIG.
+
+owner = "alfredjbclaw"
+
+[models]
+# Mission tier — frontier model, called daily, plans the work.
+mission = "anthropic/claude-opus-4-7"
+
+# Goal tier — mid-tier, called hourly, classifies the live queue against the plan.
+goal = "anthropic/claude-sonnet-4-6"
+
+# Control tier — mid-tier, called every 5m, maintains ledger and dispatches workers.
+control = "anthropic/claude-sonnet-4-6"
+
+# Agent tier — the worker LLM running inside Codex / Claude Code.
+# Provider routing is decided by [runtime].
+agent = "openai/gpt-5.5"
+
+# Tool tier — cheapest model, used by individual gh/git/test invocations.
+tool = "anthropic/claude-haiku-4-5"
+
+[runtime]
+# Worker runtime. Codex is primary by default; fallback is the workspace-local
+# Claude Code wrapper (tools/claude-code-wrapper.py).
+primary = "codex"
+fallback = "claude-code"
+
+# Automatic fallback triggers. Any one fires the fallback for the current task only.
+fallback_on = [
+  "credit_exhausted",
+  "auth_expired",
+  "rate_limit_429",
+  "three_strikes_failure",
+]
+
+[sandbox]
+# Crabbox sandbox provider. Apple VZ runs locally on Apple Silicon (no cloud
+# credentials, no monthly-spend exposure). See `crabbox doctor --provider <name>`
+# to inspect alternatives (hetzner, aws, gcp, e2b, daytona, modal, etc.).
+provider = "applevz"
+
+# Sandbox gate posture. "every" runs every worker output through Crabbox before
+# the orchestrator opens a PR. "tagged-needs-isolation" only sandboxes items
+# the triage skill flagged. Default and recommended: "every".
+gate = "every"
+
+# Default test command. Each repo can override via .pincer.toml at its root.
+default_test = "make test"
+
+[cadence]
+mission = "daily"
+goal    = "hourly"
+control = "5m"
+
+[paths]
+# Persistent state. Override only if you need to keep state under a different root.
+log    = "~/.openclaw/pincer/log.md"
+plans  = "~/.openclaw/pincer/plans/"
+state  = "~/.openclaw/pincer/state.json"
+
+# --- Repository allowlist -----------------------------------------------------
+#
+# One [[repos]] block per repository under pincer management.
+# allowDelegate=false means the orchestrator only audits + triages; no worker
+# dispatch. allowMerge=false means PRs go to the owner for the final click.
+# allowRelease=true authorizes the orchestrator to draft + publish releases
+# when the effective queue is empty and CI is green.
+
+[[repos]]
+name           = "alfredjbclaw/pincer-testbed"
+allowDelegate  = true
+allowMerge     = false
+allowRelease   = false
+test_command   = "make test"
