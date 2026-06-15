@@ -1,21 +1,41 @@
 ---
-name: gh-triage
-description: "Use whenever the user types triage or asks to triage GitHub issues, PRs, queues, CI, blockers, risk, proof, or next actions. Per-repo by default; broad cross-owner mode on request."
+name: triage
+description: "Goal tier in pincer. Hourly classifier that merges the current audit-and-plan output with the live GitHub queue, then emits a URL-first triage report bucketed as Autonomous / Needs-owner / Defer. Use when starting a pincer cycle after audit, or when the user types `triage`."
 triggers:
   - 'triage'
   - 'triage this repo'
   - 'triage queue'
   - 'triage github'
-  - 'github triage'
+  - 'pincer triage'
+  - 'goal triage'
 ---
 
-# GitHub Project Triage
+# triage (Goal)
+
+Goal tier in pincer's five-tier loop. Runs **hourly** by default. Reads the most recent plan from `audit-and-plan` and merges it with the live GitHub queue, then classifies every actionable item into one of three buckets.
 
 Always use this skill when the user types `triage`, unless the request explicitly targets a non-GitHub domain. From inside a repo, use the current GitHub project by default. Triage means maintainer-facing item cards: URL, what each issue/PR is about, why it matters, author trust, fit, risk, proof/test state, blockers, and next action. Never return only queue numbers or opaque refs.
 
 Output is URL-first: every surfaced issue/PR/repo item must include its GitHub URL in the first line or first sentence for that item. If giving a shortlist, print one URL per item.
 
-This skill is an OpenClaw-flavored adaptation of [`steipete/agent-scripts#github-project-triage`](https://github.com/steipete/agent-scripts/blob/main/skills/github-project-triage/SKILL.md) by Peter Steinberger. The upstream skill targets the Codex CLI and a personal RepoBar binary; this version uses vanilla `gh` and accepts owner scope as an argument.
+This skill is pincer's port of [`steipete/agent-scripts#github-project-triage`](https://github.com/steipete/agent-scripts/blob/main/skills/github-project-triage/SKILL.md) by Peter Steinberger. The upstream skill targets the Codex CLI and a personal RepoBar binary; pincer uses vanilla `gh`, accepts owner scope as an argument, and additionally merges with the Mission tier's plan TOML before classifying.
+
+## Plan-aware classification
+
+Before classifying the live queue, **read the most recent plan from `audit-and-plan`**:
+
+```bash
+plan=$(ls -t ~/.openclaw/pincer/plans/$(echo "$repo" | tr '/' '-')-*.toml 2>/dev/null | head -1)
+[ -n "$plan" ] && cat "$plan"
+```
+
+For each open item in the live queue, check:
+
+1. **Does the plan reference this item?** If yes, inherit its `verification` and `test_command` fields. Skip Goal-tier reclassification of items the Mission tier already analyzed.
+2. **Is the plan stale?** Plans more than 24 hours old are stale. Surface a `NEXT: re-run audit-and-plan` note before continuing.
+3. **Does the live queue contain items not in the plan?** New items since the plan was written — classify them at the Goal tier and add a `[from_triage]` note.
+
+When the plan and the live queue disagree on priority (e.g., a new high-severity bug arrived after the plan was generated), trust the live queue. The plan is a guide, not a contract.
 
 ## Scope Rule
 
@@ -109,7 +129,7 @@ Include author/opener trust for every non-maintainer item you recommend acting o
 Prefer the bundled helper:
 
 ```bash
-skills/gh-triage/scripts/github-activity.sh --repo <owner/repo> --global <login>
+skills/triage/scripts/github-activity.sh --repo <owner/repo> --global <login>
 ```
 
 Trust output must stay factual:

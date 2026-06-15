@@ -1,0 +1,14 @@
+.DS_Store
+*.pyc
+__pycache__/
+.venv/
+node_modules/
+
+# Per-user state — never check in
+state.json
+log.md
+plans/*.toml
+!plans/.gitkeep
+
+# Test artifacts
+testbeds/*/work/

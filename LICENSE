@@ -2,10 +2,15 @@ MIT License
 
 Copyright (c) 2026 Jacob Berchtold
 
-Portions of this work are derived from agent-scripts
-(https://github.com/steipete/agent-scripts), Copyright (c) 2026 Peter
-Steinberger, used under the MIT License. See README.md for attribution
-details.
+Portions of this work derive design patterns from:
+- agent-scripts (https://github.com/steipete/agent-scripts), Copyright (c) 2026
+  Peter Steinberger — maintainer-orchestrator + github-project-triage skills,
+  used under the MIT License.
+- shadcn/ui CLI (https://github.com/shadcn-ui/ui), Copyright (c) 2026 shadcn —
+  /improve plan-then-execute model-tier split, MIT License.
+- agnt (https://github.com/agnt-gg/agnt), Copyright (c) 2026 Nathan Wilbanks —
+  mission → goal → agent → workflow → tool loop hierarchy, MIT License.
+See README.md "Standing on the shoulders of" section for attribution details.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

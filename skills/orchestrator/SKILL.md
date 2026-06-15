@@ -1,30 +1,109 @@
 ---
-name: repo-orchestrator
-description: "Orchestrate delegated maintainer work across a fleet of GitHub repositories: prepare decision-ready PRs through OpenClaw subagent workers, monitor progress on an interval, ask the owner only at decision boundaries, and execute authorized releases."
+name: orchestrator
+description: "Control tier in pincer. Persistent (5-minute cadence) ledger that dispatches autonomous items to Codex-primary/Claude-Code-fallback worker subagents, gates every worker output through a `crabbox run` verdict on a clean throwaway VM, and only opens PRs on green sandbox runs. Use when continuously maintaining a repo allowlist."
 triggers:
-  - 'orchestrate repos'
   - 'orchestrate'
+  - 'orchestrate repos'
   - 'maintain my repos'
-  - 'repo orchestrator'
+  - 'pincer orchestrate'
+  - 'control tier'
   - 'keep these repos healthy'
 ---
 
-# Repo Orchestrator
+# orchestrator (Control)
 
-Coordinate repository work through completion. This is a **control-plane skill**: inspect, delegate, monitor, ask decisions, and report. Put substantial repository investigation, implementation, review, live proof, landing, and release execution in subagent worker sessions.
+Control tier in pincer's five-tier loop. **Persistent, 5-minute cadence.** Reads the most recent triage report, dispatches autonomous items to worker subagents via the **runtime adapter** (Codex primary, Claude Code fallback), and gates every worker output through a **Crabbox sandbox verdict** before opening a PR.
 
-This skill is an OpenClaw-flavored adaptation of [`steipete/agent-scripts#maintainer-orchestrator`](https://github.com/steipete/agent-scripts/blob/main/skills/maintainer-orchestrator/SKILL.md) by Peter Steinberger. The upstream skill targets Codex CLI threads; this version delegates to OpenClaw subagent sessions via `sessions_spawn` / `subagents`.
+This skill is a **control-plane** skill: inspect, delegate, monitor, ask decisions, and report. Put substantial repository investigation, implementation, review, live proof, landing, and release execution in subagent worker sessions — not here.
+
+This skill is pincer's port of [`steipete/agent-scripts#maintainer-orchestrator`](https://github.com/steipete/agent-scripts/blob/main/skills/maintainer-orchestrator/SKILL.md) by Peter Steinberger, extended with:
+- Runtime adapter (`tools/runtime_adapter.py`) — Codex primary, Claude Code automatic fallback.
+- Sandbox gate (`tools/sandbox_gate.py`) — every worker output validated by `crabbox run` on a clean throwaway VM before PR open.
+
+## The five-tier handoff
+
+```
+MISSION (audit-and-plan)  →  reads code/CI/deps → writes plans/<repo>-<date>.toml
+                              │
+                              ▼
+GOAL    (triage)          →  merges plan + live queue → emits buckets
+                              │
+                              ▼
+CONTROL (THIS SKILL)      →  reads triage → dispatches Autonomous items
+                              │
+                              ▼
+AGENT   (runtime_adapter) →  Codex primary, Claude Code fallback
+                              │
+                              ▼
+SANDBOX (sandbox_gate)    →  crabbox run -- <test_command>
+                              │
+                              ▼
+        green? → PR opens.  red? → return to AGENT for another loop.
+```
+
+## The hard rule
+
+**No PR opens without a green Crabbox verdict.** This is enforced in code by `tools/sandbox_gate.py`, not by orchestrator discretion. Even if the worker subagent self-reports `STATUS: done`, a red Crabbox verdict means the orchestrator returns the task to the worker with the test output as a new constraint.
+
+## Worker Dispatch via Runtime Adapter
+
+All worker spawns go through `tools/runtime_adapter.py`. Never invoke `codex exec` or the Claude Code wrapper directly from the orchestrator — the adapter handles:
+
+- Primary runtime invocation (Codex by default).
+- Automatic fallback to Claude Code on credit exhaustion, auth expiry, 429s, or three-strikes failure.
+- Completion contract parsing (`STATUS:` / `FILES:` / `VALIDATION:` / `NEXT:`).
+- Structured `RunResult` return.
+
+Dispatch a worker from a TOML plan item:
+
+```bash
+python3 tools/runtime_adapter.py \
+    --workdir "$repo_workdir" \
+    --prompt-file "$brief" \
+    --json > /tmp/run-result.json
+
+status=$(jq -r .status /tmp/run-result.json)
+files=$(jq -r '.files | join(",")' /tmp/run-result.json)
+fb_used=$(jq -r .fallback_used /tmp/run-result.json)
+```
+
+If `fallback_used == true`, log the trigger to `~/.openclaw/pincer/log.md` so we can track runtime-adapter health.
+
+## Sandbox Gate (the Crabbox verdict)
+
+After every worker `STATUS: done`, validate the diff via `tools/sandbox_gate.py`:
+
+```bash
+python3 tools/sandbox_gate.py \
+    --workdir "$repo_workdir" \
+    --test "$test_command" \
+    --json > /tmp/verdict.json
+
+verdict=$(jq -r .verdict /tmp/verdict.json)
+```
+
+Decision matrix:
+
+| Sandbox verdict | Worker status | Orchestrator action |
+|---|---|---|
+| `pass` | `done` | Open PR. Worker output is the final artifact. |
+| `pass` | `no_changes` | Close item with proof. No PR. |
+| `fail` | (any) | Return failure to worker with `stderr_tail` as additional constraint. Loop. |
+| `error` (crabbox_infra_failure) | (any) | Surface to owner as a system-level blocker. Do not open PR. Do not retry the worker. |
+| `error` (crabbox_not_installed / workdir_invalid) | (any) | Hard stop. Surface installation guidance to owner. |
+
+The sandbox gate is a **hard dependency**. If Crabbox is unavailable, the orchestrator pauses and surfaces the issue. It does NOT silently degrade to "no-sandbox mode" — that would defeat the purpose of the gate.
 
 ## Repository Scope
 
-- Operate on the set of repositories the owner has explicitly placed under orchestration. Maintain that set in a configurable allowlist (`<workspace>/repo-orchestrator.json` by default) keyed by `owner/repo`.
+- Operate on the set of repositories the owner has explicitly placed under orchestration. Maintain that set in `~/.openclaw/pincer.toml` keyed by `owner/repo` under `[[repos]]`.
 - Exclude any repository the owner has explicitly named as excluded.
 - Determine uncertain ownership from repository contribution history, not repository name alone.
 - Keep a current repository ledger so completed lanes are replaced by real queue or release work.
 
 ## Operating Model
 
-1. Use the [`gh-triage`](../gh-triage/SKILL.md) skill to map each repository's open issues, open PRs, CI, latest release, package metadata, and unreleased changelog.
+1. Use the [`triage`](../triage/SKILL.md) skill to map each repository's open issues, open PRs, CI, latest release, package metadata, and unreleased changelog — fused with the most recent [`audit-and-plan`](../audit-and-plan/SKILL.md) TOML.
 2. Classify every queue item:
    - **`Autonomous`**: clear fit, reproducible, bounded implementation, and usable verification path.
    - **`Needs owner`**: product choice, security/privacy decision, unavailable credentials/access, unavailable live proof, or destructive/irreversible choice.
@@ -107,7 +186,7 @@ Never interrupt, archive, rename, duplicate, or replace a worker without first r
 
 ## Persistent Log
 
-- This root orchestrator owns its log file (default `<workspace>/repo-orchestrator-log.md`); workers do not edit it.
+- This root orchestrator owns its log file (`~/.openclaw/pincer/log.md` by default; configurable via `[paths]` in `~/.openclaw/pincer.toml`); workers do not edit it.
 - Append dated, high-level entries for meaningful actions and decisions: policy/skill/automation changes, worker creation or reassignment, queue decisions, lands, closes, releases, and exact blockers.
 - Include full canonical issue/PR URLs when relevant.
 - Never record secrets or routine polling.

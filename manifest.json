@@ -1,20 +1,38 @@
 {
-  "name": "openclaw-maintainer-skills",
+  "name": "pincer",
   "version": "0.1.0",
   "conformance_version": "1.0.0",
-  "description": "OpenClaw-flavored maintainer skills: per-repo gh-triage + multi-repo repo-orchestrator. Adapted from steipete/agent-scripts for the OpenClaw agent runtime.",
-  "homepage": "https://github.com/alfredjbclaw/openclaw-maintainer-skills",
+  "description": "A four-tier autonomous maintainer loop for OpenClaw: Mission (audit & plan) → Goal (triage) → Control (orchestrate) → Agent (Codex/Claude Code) → Sandbox (Crabbox) → Tool. Frontier-model plans, mid-tier executes, sandboxed verification before every PR.",
+  "homepage": "https://github.com/alfredjbclaw/pincer",
   "license": "MIT",
   "skills": [
     {
-      "name": "gh-triage",
-      "path": "skills/gh-triage/SKILL.md",
-      "description": "Use whenever the user types triage or asks to triage GitHub issues, PRs, queues, CI, blockers, risk, proof, or next actions. Per-repo by default; broad cross-owner mode on request."
+      "name": "audit-and-plan",
+      "path": "skills/audit-and-plan/SKILL.md",
+      "description": "Mission tier. Frontier-model (Opus) repo audit that reads code, CI, dependencies, and changelog, then writes a structured TOML plan of priorities, dependencies, and verification paths to plans/<repo>-<date>.toml. Pattern credit: shadcn /improve."
     },
     {
-      "name": "repo-orchestrator",
-      "path": "skills/repo-orchestrator/SKILL.md",
-      "description": "Orchestrate delegated maintainer work across a fleet of GitHub repositories: prepare decision-ready PRs through OpenClaw subagent workers, monitor progress on an interval, ask the owner only at decision boundaries, and execute authorized releases."
+      "name": "triage",
+      "path": "skills/triage/SKILL.md",
+      "description": "Goal tier. Hourly classifier (Sonnet) that merges the current plan with the live GitHub queue and emits a URL-first triage report bucketed as Autonomous / Needs-owner / Defer. Pattern credit: steipete github-project-triage."
+    },
+    {
+      "name": "orchestrator",
+      "path": "skills/orchestrator/SKILL.md",
+      "description": "Control tier. Persistent (5-minute cadence) ledger that dispatches autonomous items to Codex-primary/Claude-Code-fallback worker subagents, gates every worker output through a `crabbox run` verdict on a clean throwaway VM, and only opens PRs on green sandbox runs. Pattern credit: steipete maintainer-orchestrator + nathan loop hierarchy."
+    },
+    {
+      "name": "keeper",
+      "path": "skills/keeper/SKILL.md",
+      "description": "Meta-runner. Single-command `keeper run <repo>` invocation that drives the full Mission → Goal → Control pipeline against a configured repo allowlist using sane defaults from config.toml. The ergonomic surface for daily use."
     }
-  ]
+  ],
+  "runtime_dependencies": {
+    "crabbox": ">=0.31.0",
+    "codex": ">=0.131.0",
+    "gh": ">=2.0.0"
+  },
+  "optional_dependencies": {
+    "claude-code-wrapper": "tools/claude-code-wrapper.py (workspace-local, used as runtime fallback)"
+  }
 }
