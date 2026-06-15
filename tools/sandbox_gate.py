@@ -161,14 +161,26 @@ def gate(
         )
 
     # Distinguish "test failed" (verdict=fail) from "crabbox itself failed"
-    # (verdict=error). crabbox exits non-zero when the broker / lease / sync
-    # itself fails. We detect this by looking for a "test command exited" line
-    # in stdout/stderr — if absent, the failure was infra, not the test.
-    looks_like_test_ran = any(
-        marker in (proc.stdout + proc.stderr)
-        for marker in ("command exited with status", "exit code", "test failed", "FAILED")
+    # (verdict=error). Crabbox emits a "command complete" / "remote command
+    # exited" line once it has finished the user command. If we see those
+    # markers, infra was fine and the user command itself is what failed —
+    # that's a `fail` verdict (return to worker). If we don't see them,
+    # Crabbox itself failed at the broker / lease / sync layer — that's
+    # an `error` (surface to owner).
+    combined = proc.stdout + proc.stderr
+    infra_completed = any(
+        marker in combined
+        for marker in (
+            "command complete in",
+            "remote command exited",
+            "command exited with status",
+            "command exited code",
+            "exit code",
+            "test failed",
+            "FAILED",
+        )
     )
-    if looks_like_test_ran:
+    if infra_completed:
         return SandboxVerdict(
             verdict="fail",
             exit_code=proc.returncode,
