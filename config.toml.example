@@ -50,6 +50,17 @@ gate = "every"
 # Default test command. Each repo can override via .pincer.toml at its root.
 default_test = "make test"
 
+# Maximum concurrent Crabbox VMs at any one time. Each Apple VZ VM
+# pre-allocates 8 GiB of host memory by default. Stacking VMs is the fastest
+# way to burn through RAM on a workstation. Default: 1 (strict serialization).
+# Raise only if the host has enough memory to absorb N × 8 GiB without paging.
+max_concurrent = 1
+
+# Per-lease idle timeout. Crabbox releases stale leases automatically; this is
+# the safety net in case the orchestrator crashes mid-run. Match to your
+# worker's expected ceiling. Default: 30 minutes.
+idle_timeout = "30m"
+
 [cadence]
 mission = "daily"
 goal    = "hourly"
