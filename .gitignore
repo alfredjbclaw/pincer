@@ -12,3 +12,5 @@ plans/*.toml
 
 # Test artifacts
 testbeds/*/work/
+.specify/
+.claude/
