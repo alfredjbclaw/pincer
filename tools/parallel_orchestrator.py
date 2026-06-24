@@ -77,8 +77,11 @@ def issue_brief(repo: str, n: int) -> tuple[str, str]:
     out, _, _ = sh(["gh", "issue", "view", str(n), "-R", repo, "--json", "title,body"])
     data = json.loads(out)
     brief = (f"Fix {repo} issue #{n}: {data['title']}\n\n{data['body']}\n\n"
-             "Keep the change minimal and idiomatic. If a matching xfail test exists, "
-             "remove the xfail marker so it actively verifies the fix.")
+             "Keep the change minimal and idiomatic. REQUIRED: add a test that captures "
+             "this bug — one that FAILS on the current code and PASSES after your fix. If "
+             "a matching xfail test exists, remove the xfail marker. You do NOT need to "
+             "run the suite yourself — a sandbox with the project's deps installed will "
+             "run it. Just make the fix and include the failing-first test.")
     return data["title"], brief
 
 
@@ -182,8 +185,11 @@ def stage_review(cand: dict, repo: str, base_branch: str) -> dict:
         return cand
     wt = cand["worktree"]
     diff, _, _ = sh(["git", "-C", wt, "diff", f"{base_branch}...HEAD"])
-    criteria = ("Eloquent, generalizable, PII-free, novel, tested, builds clean, "
-                "minimal/scoped, docs updated if needed.")
+    criteria = ("Eloquent, generalizable, PII-free, novel, builds clean, minimal/scoped, "
+                "docs updated if needed. CRITICAL: the change must include a test that "
+                "would FAIL on the original buggy code and PASS with this fix — judge "
+                "whether the added/changed test actually exercises the reported bug, not "
+                "just that some test exists.")
     v = rv.review(diff, cand["title"], criteria, repo_workdir=wt, timeout=600)
     cand["review"] = {"verdict": v.verdict, "blockers": v.blockers}
     cand["_review_obj"] = v
@@ -240,13 +246,14 @@ def stage_gate(cand: dict, repo: str, main_workdir: Path, allow_merge: bool, bas
     pyf = [f for f in files if f.endswith(".py")]
     compile_rc = sh(["python3", "-m", "py_compile"] + pyf, cwd=wt)[2] if pyf else 0
     rvobj = cand["_review_obj"]
+    has_test = any("test" in f.lower() for f in files)
     gi = pg.GateInputs(
         repo=pg.RepoMeta(owner=repo.split("/")[0], name=repo.split("/")[1], is_owned=True),
         diff=pg.DiffStats(lines_changed=lines, files=files),
         worker_status="done", tests_green=True, lint_clean=(compile_rc == 0),
         build_clean=(compile_rc == 0), has_secrets=secrets,
         docs_updated_if_needed=True, review=rvobj,
-        change_type=rvobj.change_type)
+        change_type=rvobj.change_type, has_test=has_test)
     d = pg.decide(gi)
     cand["gate"] = {"action": d.action, "reasons": d.reasons, "danger": d.danger_surface}
 

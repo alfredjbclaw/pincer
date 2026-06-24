@@ -71,6 +71,19 @@ def test_decide_escalates_big_diff_even_when_bugfix() -> None:
     assert "large diff" in decision.reasons[0]
 
 
+def test_decide_opens_pr_when_fix_has_no_test() -> None:
+    # A code fix with no accompanying test is unproven -> PR, never auto-merge.
+    decision = decide(clean_inputs(files=["src/calc.py"], change_type="bugfix"))  # has_test default True
+    assert decision.action == "auto_merge"  # baseline: with a test it merges
+    no_test = decide(clean_inputs(files=["src/calc.py"], change_type="bugfix",
+                                  review=ReviewVerdict(verdict="approve", blockers=[])))
+    # explicitly strip the test
+    import dataclasses as _dc
+    no_test = decide(_dc.replace(clean_inputs(files=["src/calc.py"]), has_test=False))
+    assert no_test.action == "open_pr"
+    assert any("no test" in r for r in no_test.reasons)
+
+
 def test_decide_auto_merges_small_adjustment() -> None:
     decision = decide(clean_inputs(files=["src/calc.py"], change_type="adjustment", lines_changed=8))
     assert decision.action == "auto_merge"

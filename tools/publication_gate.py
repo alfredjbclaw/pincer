@@ -69,6 +69,9 @@ class GateInputs:
     review: ReviewVerdict
     # bugfix/adjustment ship when confirmed; feature/big_change go to owner (PR).
     change_type: str = "bugfix"
+    # A code fix must ship a test (the failing-first discipline, adapted from
+    # ulw's RED->GREEN). No test -> unproven -> PR, never auto-merge.
+    has_test: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,6 +139,8 @@ def _production_ready_failures(inputs: GateInputs) -> list[str]:
         reasons.append("secrets present in diff")
     if not inputs.docs_updated_if_needed:
         reasons.append("docs not updated if needed")
+    if not inputs.has_test:
+        reasons.append("no test proving the fix (RED→GREEN discipline)")
     if inputs.review.verdict != "approve":
         reasons.append("review rejected")
     reasons.extend(f"review blocker: {blocker}" for blocker in inputs.review.blockers)
