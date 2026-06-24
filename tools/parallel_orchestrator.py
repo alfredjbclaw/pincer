@@ -178,11 +178,32 @@ def stage_sandbox(cand: dict, test_cmd: str) -> dict:
         out, err, rc = sh(["python3", str(THIS / "sandbox_gate.py"), "--workdir",
                            cand["worktree"], "--test", test_cmd, "--json"], timeout=1800)
     try:
-        cand["sandbox"] = json.loads(out).get("verdict", "error")
+        j = json.loads(out)
+        cand["sandbox"] = j.get("verdict", "error")
+        cand["sandbox_fail"] = _extract_test_failure(j.get("stdout_tail", "") + "\n" + j.get("stderr_tail", ""))
     except Exception:
         cand["sandbox"] = "error"
-    cand["sandbox_tail"] = (err or out)[-300:]
+        cand["sandbox_fail"] = (err or out)[-500:]
     return cand
+
+
+def _extract_test_failure(blob: str) -> str:
+    """Pull the meaningful test-failure lines out of the sandbox output (the
+    `N failed, M passed` summary + the FAILED test names + the first assertion),
+    skipping the crabbox provisioning/cleanup boilerplate that dominates the tail."""
+    lines = blob.splitlines()
+    keep = [ln for ln in lines if any(m in ln for m in
+            ("FAILED", "ERROR", "passed", "failed", "AssertionError", "Error:", "assert "))
+            and not any(noise in ln for noise in ("crabbox", "lease", "provision", "rsync", "debconf"))]
+    summary = keep[-12:] if keep else lines[-8:]
+    return "\n".join(summary)[:1200]
+
+
+def _retryable_sandbox(verdict: str) -> bool:
+    """Tests ran and some failed (a fixable regression) -> retry. An infra
+    'error' (VM/dep/network) is NOT something a code edit can fix -> don't burn
+    tokens retrying it."""
+    return verdict == "fail"
 
 
 # --- Stage 3: review (parallel) --------------------------------------------
@@ -217,27 +238,23 @@ def _stage_changes(wt: str) -> list[str]:
 
 # --- Stage 3.5: revise rejected fixes once with the reviewer's blockers -----
 
-def stage_revise(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg) -> dict:
-    """One revision pass: hand the worker the reviewer's blockers, re-sandbox,
-    re-review. Turns 'rejected -> PR' into 'fixed -> merge' when the blockers
-    are addressable. Capped at one retry to avoid loops."""
+def stage_revise(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg, feedback: str) -> dict:
+    """One revision pass: hand the worker concrete feedback (a test regression or
+    the reviewer's blockers), re-sandbox, re-review. Turns 'failed/rejected -> PR'
+    into 'fixed -> merge' when addressable. Capped at one retry per candidate
+    (the `revised` flag) so we adjust for slips without burning tokens in a loop."""
     wt = cand["worktree"]
-    rv_obj = cand.get("_review_obj")
-    if not rv_obj or not rv_obj.blockers:
-        return cand
-    title, brief = issue_brief(repo, cand["issue"])
-    revision = (brief + "\n\nAn independent reviewer REJECTED your previous fix on this branch. "
-                "Address ALL of these blockers, keep the change minimal, and make sure the "
-                "failing-first test still proves the fix:\n"
-                + "\n".join(f"- {b}" for b in rv_obj.blockers))
+    _, brief = issue_brief(repo, cand["issue"])
+    revision = (brief + "\n\n" + feedback
+                + "\nKeep the change minimal and narrow, and make sure the failing-first "
+                "test still proves the fix without breaking other tests.")
     res = ra.dispatch(revision, workdir=wt, config=cfg)
     changed = _stage_changes(wt)
     if changed:
-        sh(["git", "-C", wt, "commit", "-q", "-m", f"Address review blockers: #{cand['issue']}"])
+        sh(["git", "-C", wt, "commit", "-q", "-m", f"Address review feedback: #{cand['issue']}"])
         cand["changed"] = sorted(set(cand.get("changed", []) + changed))
     cand["revised"] = True
     cand["revise_runtime"] = res.runtime
-    # Re-verify: sandbox then review.
     stage_sandbox(cand, test_cmd)
     stage_review(cand, repo, base_branch)
     return cand
@@ -386,21 +403,34 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
         stage_sandbox(c, test_cmd)
         state["candidates"][str(c["issue"])] = c
         save()
-    passed = [c for c in done if c.get("sandbox") == "pass"]
-    alert(f"📦 Stage 2 SANDBOX done — {len(passed)}/{len(done)} green "
+    alert(f"📦 Stage 2 SANDBOX done — {sum(1 for c in done if c.get('sandbox')=='pass')}/{len(done)} green "
           f"({', '.join('#%s:%s' % (c['issue'], c.get('sandbox')) for c in done)}).")
 
-    # Stage 3: review — parallel
+    # Stage 2.5: retry REGRESSIONS once (tests ran and failed -> fixable). Infra
+    # 'error' verdicts are skipped — a code edit can't fix a VM/dep problem.
+    sb_retry = [c for c in done if _retryable_sandbox(c.get("sandbox")) and not c.get("revised")]
+    if sb_retry:
+        alert(f"♻️ Revising {len(sb_retry)} fix(es) that broke tests: "
+              + ", ".join(f"#{c['issue']}" for c in sb_retry))
+        for c in sb_retry:
+            fb = ("Your change broke existing tests in the sandbox. Fix the regression — "
+                  "make the fix narrower so it doesn't break unrelated tests:\n" + (c.get("sandbox_fail") or ""))
+            stage_revise(c, repo, base_branch, test_cmd, cfg, fb)
+            state["candidates"][str(c["issue"])] = c
+            save()
+    passed = [c for c in done if c.get("sandbox") == "pass"]
+
+    # Stage 3: review — parallel (skip ones already reviewed during a revise)
+    need_review = [c for c in passed if not c.get("_review_obj")]
     with cf.ThreadPoolExecutor(max_workers=max_coders) as ex:
-        list(ex.map(lambda c: stage_review(c, repo, base_branch), passed))
+        list(ex.map(lambda c: stage_review(c, repo, base_branch), need_review))
     for c in passed:
         state["candidates"][str(c["issue"])] = c
     save()
     alert("🔎 Stage 3 REVIEW done — " +
           ", ".join("#%s:%s" % (c["issue"], c["review"]["verdict"]) for c in passed))
 
-    # Stage 3.5: revise rejected fixes once with the reviewer's blockers.
-    # Sandbox re-runs serialize on SANDBOX_LOCK; do these sequentially.
+    # Stage 3.5: revise reviewer-rejected fixes once with the blockers.
     to_retry = [c for c in passed
                 if c.get("_review_obj") and c["_review_obj"].verdict != "approve"
                 and c["_review_obj"].blockers and not c.get("revised")]
@@ -408,12 +438,15 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
         alert(f"♻️ Revising {len(to_retry)} rejected fix(es) with reviewer blockers: "
               + ", ".join(f"#{c['issue']}" for c in to_retry))
         for c in to_retry:
-            stage_revise(c, repo, base_branch, test_cmd, cfg)
+            fb = ("An independent reviewer REJECTED your fix. Address ALL these blockers:\n"
+                  + "\n".join(f"- {b}" for b in c["_review_obj"].blockers))
+            stage_revise(c, repo, base_branch, test_cmd, cfg, fb)
             state["candidates"][str(c["issue"])] = c
             save()
         flipped = sum(1 for c in to_retry if c["_review_obj"].verdict == "approve")
         alert(f"♻️ Revision done — {flipped}/{len(to_retry)} now approved "
               + ", ".join("#%s:%s" % (c["issue"], c["_review_obj"].verdict) for c in to_retry))
+        passed = [c for c in done if c.get("sandbox") == "pass"]  # some may have flipped
 
     # Stage 4: gate + publish (serial publish via lock)
     for c in passed:
@@ -423,8 +456,20 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
 
     merged = [c for c in passed if c.get("published") == "auto_merged"]
     prd = [c for c in passed if str(c.get("published", "")).startswith("pr")]
-    alert(f"🏁 Parallel loop DONE — {len(merged)} auto-merged, {len(prd)} PR'd. "
-          + " | ".join("#%s:%s" % (c["issue"], c.get("published", "?")) for c in passed))
+    # Surface everything else so nothing silently vanishes: a candidate that
+    # never passed the sandbox (regression we couldn't fix, or infra error), or
+    # a worker that produced no changes.
+    failed = [c for c in done if c.get("sandbox") not in ("pass", None)]
+    no_change = [c for c in cands if not c.get("committed")]
+    state["result"] = "done"
+    state["scorecard"] = {"merged": [c["issue"] for c in merged],
+                          "prd": [c["issue"] for c in prd],
+                          "failed_verification": [c["issue"] for c in failed],
+                          "no_changes": [c.get("issue") for c in no_change]}
+    alert(f"🏁 Parallel loop DONE — {len(merged)} merged, {len(prd)} PR'd, "
+          f"{len(failed)} failed verification, {len(no_change)} no-change. "
+          + " | ".join("#%s:%s" % (c["issue"], c.get("published") or c.get("sandbox", "?"))
+                       for c in done))
     save()
     return state
 
