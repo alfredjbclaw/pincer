@@ -77,9 +77,11 @@ RATE_LIMIT_PATTERNS = (
 
 WORKER_CONTRACT = """
 Completion contract for this unattended pincer worker run:
-- Do the actual work — implement, write tests, commit on a branch.
-- Do NOT push, open PRs, or merge. The orchestrator handles publication after
-  the sandbox verdict.
+- Do the actual work — implement and write tests, and prove the tests pass.
+- Leave your changes UNCOMMITTED in the working tree. Do NOT commit, branch,
+  push, stage, open PRs, or merge — the orchestrator owns every git operation
+  and handles publication after the sandbox verdict. (Your sandbox cannot write
+  .git anyway; attempting git is what makes a clean run look blocked.)
 - If you decide no changes are needed, say that explicitly and explain why.
 - Before you finish, include a final block with these exact markers on their
   own lines:
@@ -99,6 +101,7 @@ class RuntimeConfig:
     primary: str = "codex"
     fallback: str = "claude-code"
     fallback_enabled: bool = True
+    ultrawork: bool = True
     codex_model: str = "gpt-5.5"
     claude_model: str = "claude-opus-4-6"
     codex_sandbox: str = "workspace-write"
@@ -126,6 +129,7 @@ class RuntimeConfig:
             primary=rt.get("primary", "codex"),
             fallback=rt.get("fallback", "claude-code"),
             fallback_enabled=bool(rt.get("fallback", "claude-code")),
+            ultrawork=bool(rt.get("ultrawork", True)),
             codex_model=codex_model,
         )
 
@@ -187,6 +191,7 @@ def _run_codex(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str
     """Invoke codex exec, return (last_message, combined_stderr, exit_code)."""
     if shutil.which("codex") is None:
         return ("", "codex CLI not found on PATH", 127)
+    worker_prompt = f"ulw: {prompt}" if cfg.ultrawork else prompt
     with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as last_msg_file:
         last_msg_path = Path(last_msg_file.name)
     try:
@@ -197,7 +202,7 @@ def _run_codex(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str
             "--model", cfg.codex_model,
             "--skip-git-repo-check",
             "--output-last-message", str(last_msg_path),
-            prompt + "\n\n" + WORKER_CONTRACT,
+            worker_prompt + "\n\n" + WORKER_CONTRACT,
         ]
         proc = subprocess.run(
             cmd,
@@ -231,9 +236,37 @@ def _run_claude_code(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[st
             text=True,
             timeout=cfg.timeout_seconds,
         )
-        return (proc.stdout, proc.stderr, proc.returncode)
+        # The wrapper emits a JSON envelope; the worker's contract block lives in
+        # its `final_text`, not at the top level of stdout. Hand the contract
+        # parser the final_text (else STATUS:/FILES: never match -> false error).
+        text, exit_code = _unwrap_wrapper_output(proc.stdout, proc.returncode)
+        return (text, proc.stderr, exit_code)
     except subprocess.TimeoutExpired:
         return ("", f"claude-code wrapper timed out after {cfg.timeout_seconds}s", 124)
+
+
+def _unwrap_wrapper_output(stdout: str, returncode: int) -> tuple[str, int]:
+    """Pull final_text from the claude-code-wrapper JSON envelope.
+
+    Returns (text_to_parse, effective_exit). A genuine timeout/agent-error keeps
+    a non-zero exit so dispatch can react; otherwise the wrapper's own non-zero
+    exit on benign conditions is not allowed to mask a real completion contract.
+    """
+    try:
+        obj = json.loads(stdout.strip())
+    except (json.JSONDecodeError, ValueError):
+        return (stdout, returncode)
+    if not isinstance(obj, dict):
+        return (stdout, returncode)
+    final_text = obj.get("final_text") or ""
+    if obj.get("timed_out"):
+        return (final_text, 124)
+    last_result = obj.get("last_result")
+    if isinstance(last_result, dict) and last_result.get("is_error"):
+        return (final_text, returncode or 1)
+    # Benign: trust the contract block inside final_text; let _extract_contract
+    # decide done/blocked. Report exit 0 so a STATUS:done isn't masked.
+    return (final_text, 0)
 
 
 def _execute(runtime: str, prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str, int]:
