@@ -78,7 +78,7 @@ def main() -> int:
     g.add_argument("--all-issues", action="store_true")
     g.add_argument("--issues", help="comma-separated issue numbers")
     g.add_argument("--audit", action="store_true")
-    ap.add_argument("--max-coders", type=int, default=4)
+    ap.add_argument("--max-coders", type=int, default=6)
     ap.add_argument("--max-findings", type=int, default=12)
     ap.add_argument("--no-merge", action="store_true")
     a = ap.parse_args()

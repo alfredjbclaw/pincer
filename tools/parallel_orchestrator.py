@@ -108,17 +108,44 @@ def make_worktree(main_workdir: Path, base: Path, n: int, base_branch: str) -> P
 
 # --- Stage 1: code (parallel) ----------------------------------------------
 
+# Worker scratch that must never enter a commit/diff (ulw notepad + evidence,
+# codegraph caches, ulw note files).
+_SCRATCH_PREFIXES = (".omo", ".codegraph", ".openclaw-ulw", ".specify", ".pytest_cache")
+
+
+def _is_scratch(path: str) -> bool:
+    p = path.lower()
+    return (any(p.startswith(pre) for pre in _SCRATCH_PREFIXES)
+            or ("ulw" in p and p.endswith("notes.md"))
+            or p.endswith(".pyc"))
+
+
+def usage_ok() -> bool:
+    """True if the Codex subscription window/week is under the halt threshold."""
+    try:
+        rc = subprocess.run(
+            ["python3", "/Users/alfred/.openclaw/workspace/tools/usage_gate.py",
+             "--provider", "codex"], capture_output=True, timeout=60).returncode
+        return rc != 2  # 2 == window/week >= 80%
+    except Exception:
+        return True  # fail open — never block on a gate error
+
+
 def stage_code(repo: str, main_workdir: Path, base: Path, n: int, cfg, base_branch: str) -> dict:
     title, brief = issue_brief(repo, n)
     wt = make_worktree(main_workdir, base, n, base_branch)
     res = ra.dispatch(brief, workdir=wt, config=cfg)
     # Worker left changes uncommitted (no-git contract). Stage everything, then
-    # unstage ulw scratch so it never enters the diff. Do NOT touch .gitignore —
-    # that shows up as unrelated scope creep and trips the reviewer.
+    # unstage all worker scratch (ulw/codegraph notepads + evidence) so it never
+    # enters the diff. Do NOT touch .gitignore — that reads as unrelated scope
+    # creep and trips the reviewer.
     sh(["git", "-C", str(wt), "add", "-A"])
-    sh(["git", "-C", str(wt), "reset", "-q", "--", ".omo"])
     co, _, _ = sh(["git", "-C", str(wt), "diff", "--cached", "--name-only"])
-    changed = [f for f in co.split("\n") if f.strip() and not f.startswith(".omo")]
+    staged = [f for f in co.split("\n") if f.strip()]
+    scratch = [f for f in staged if _is_scratch(f)]
+    if scratch:
+        sh(["git", "-C", str(wt), "reset", "-q", "--"] + scratch)
+    changed = [f for f in staged if not _is_scratch(f)]
     committed = False
     if changed:
         sh(["git", "-C", str(wt), "commit", "-q", "-m",
@@ -262,14 +289,20 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     def save():
         state_path.write_text(json.dumps(state, indent=2, default=str))
 
+    if not usage_ok():
+        alert("⏸️ Usage gate ≥80% — holding the loop before dispatch. Will not burn the window.")
+        state["result"] = "halted_usage"
+        save()
+        return state
+
     alert(f"🧵 Parallel loop START — {repo} issues {issues}, up to {max_coders} coders in parallel "
           f"(base branch: {base_branch}). Crabbox serialized; reviews parallel.")
 
-    # Stage 1: code — parallel
+    # Stage 1: code — parallel (per-coder progress so a long stage isn't silent)
     cands = []
     with cf.ThreadPoolExecutor(max_workers=max_coders) as ex:
         futs = {ex.submit(stage_code, repo, main_workdir, base, n, cfg, base_branch): n for n in issues}
-        for fut in cf.as_completed(futs):
+        for i, fut in enumerate(cf.as_completed(futs), 1):
             n = futs[fut]
             try:
                 c = fut.result()
@@ -278,6 +311,9 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
             cands.append(c)
             state["candidates"][str(n)] = c
             save()
+            mark = "✓" if c.get("committed") else "∅"
+            alert(f"  {mark} coded #{n} [{i}/{len(issues)}] — {c.get('worker_status','?')} "
+                  f"({c.get('runtime','?')}), {len(c.get('changed', []))} file(s)")
     done = [c for c in cands if c.get("committed")]
     alert(f"⌨️ Stage 1 CODE done — {len(done)}/{len(issues)} produced changes "
           f"({', '.join('#%s:%s' % (c['issue'], c.get('runtime','?')) for c in cands)}).")
@@ -319,7 +355,7 @@ def main():
     ap.add_argument("--repo", required=True)
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--issues", required=True, help="comma-separated issue numbers")
-    ap.add_argument("--max-coders", type=int, default=4)
+    ap.add_argument("--max-coders", type=int, default=6)
     ap.add_argument("--no-merge", action="store_true", help="PR everything, never auto-merge")
     a = ap.parse_args()
     issues = [int(x) for x in a.issues.split(",") if x.strip()]
