@@ -77,3 +77,30 @@ def test_run_claude_code_never_prepends_ulw(monkeypatch, tmp_path) -> None:
     # Then: the prompt sent to Claude Code does not include the Codex-only trigger.
     assert captured_prompt[0].startswith("implement task\n\n")
     assert not captured_prompt[0].startswith("ulw: ")
+
+
+def test_unwrap_wrapper_output_extracts_final_text():
+    import json as _json
+    import runtime_adapter as ra
+    env = _json.dumps({"ok": True, "returncode": 1, "timed_out": False,
+                       "last_result": {"is_error": False},
+                       "final_text": "STATUS: done\nFILES: src/calc.py\nVALIDATION: pytest\nNEXT: none"})
+    text, rc = ra._unwrap_wrapper_output(env, 1)
+    assert "STATUS: done" in text
+    assert rc == 0  # benign wrapper non-zero exit must not mask a real completion
+    c = ra._extract_contract(text)
+    assert c["status"] == "done" and c["files"] == ["src/calc.py"]
+
+
+def test_unwrap_wrapper_output_preserves_timeout():
+    import json as _json
+    import runtime_adapter as ra
+    env = _json.dumps({"timed_out": True, "final_text": "STATUS: done"})
+    text, rc = ra._unwrap_wrapper_output(env, 124)
+    assert rc == 124  # genuine timeout stays a failure
+
+
+def test_unwrap_wrapper_output_passthrough_raw_text():
+    import runtime_adapter as ra
+    text, rc = ra._unwrap_wrapper_output("STATUS: done\nFILES: none", 0)
+    assert "STATUS: done" in text and rc == 0
