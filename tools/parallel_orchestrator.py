@@ -99,10 +99,9 @@ def stage_code(repo: str, main_workdir: Path, base: Path, n: int, cfg) -> dict:
     title, brief = issue_brief(repo, n)
     wt = make_worktree(main_workdir, base, n)
     res = ra.dispatch(brief, workdir=wt, config=cfg)
-    # Worker left changes uncommitted (no-git contract). Stage + commit here,
-    # excluding ulw scratch.
-    sh(["git", "-C", str(wt), "rm", "-r", "--cached", "--ignore-unmatch", ".omo"])
-    (wt / ".gitignore").open("a").write("\n.omo/\n")
+    # Worker left changes uncommitted (no-git contract). Stage everything, then
+    # unstage ulw scratch so it never enters the diff. Do NOT touch .gitignore —
+    # that shows up as unrelated scope creep and trips the reviewer.
     sh(["git", "-C", str(wt), "add", "-A"])
     sh(["git", "-C", str(wt), "reset", "-q", "--", ".omo"])
     co, _, _ = sh(["git", "-C", str(wt), "diff", "--cached", "--name-only"])
