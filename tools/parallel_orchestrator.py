@@ -115,11 +115,19 @@ def make_worktree(main_workdir: Path, base: Path, n: int, base_branch: str) -> P
 # Worker scratch that must never enter a commit/diff (ulw notepad + evidence,
 # codegraph caches, ulw note files).
 _SCRATCH_PREFIXES = (".omo", ".codegraph", ".openclaw-ulw", ".specify", ".pytest_cache")
+# Dependency lockfiles a worker regenerates as a side effect of setting up its
+# env (e.g. codex runs `uv`, dropping a stray uv.lock). A bug fix should never
+# touch deps; if it genuinely needs a dep change, that's a bigger change that
+# goes to a PR anyway. Reviewer flagged these as the #1 blocker on every reject.
+_SCRATCH_BASENAMES = ("uv.lock", "__pycache__")
 
 
 def _is_scratch(path: str) -> bool:
     p = path.lower()
+    base = p.rsplit("/", 1)[-1]
     return (any(p.startswith(pre) for pre in _SCRATCH_PREFIXES)
+            or base in _SCRATCH_BASENAMES
+            or "__pycache__" in p
             or ("ulw" in p and p.endswith("notes.md"))
             or p.endswith(".pyc"))
 
