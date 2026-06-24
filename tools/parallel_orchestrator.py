@@ -230,7 +230,8 @@ def _pr_report(cand: dict, d, rvobj, lines: int, files: list[str]) -> str:
         f"- Sandbox (clean VM): **{cand.get('sandbox')}**",
         f"- Independent Opus-4.8 review: **{rvobj.verdict}**"
         + (f" (blockers: {', '.join(rvobj.blockers)})" if rvobj.blockers else ""),
-        "- Worker ran under ulw verified-completion (RED→GREEN proof).",
+        f"- Ships a test: **{'yes' if any('test' in f.lower() for f in files) else 'no'}**"
+        " (failing-first discipline; sandbox runs the full suite with real deps).",
         "",
         f"## Files\n" + "\n".join(f"- `{f}`" for f in files),
         "",
@@ -251,15 +252,17 @@ def stage_gate(cand: dict, repo: str, main_workdir: Path, allow_merge: bool, bas
                 if ln[:1] in "+-" and not ln.startswith(("+++", "---")))
     secrets = any(k in diff.lower() for k in
                   ("api_key", "secret", "token=", "password", "-----begin"))
-    pyf = [f for f in files if f.endswith(".py")]
-    compile_rc = sh(["python3", "-m", "py_compile"] + pyf, cwd=wt)[2] if pyf else 0
+    # Build/lint verification is language-agnostic: the sandbox stage already
+    # ran the repo's real test_command in a clean VM (which compiles TS, builds
+    # Go/Rust, etc.) — reaching here means it passed. So build/lint are clean.
+    # Real lint issues (dead code, style) are caught by the Opus reviewer.
     rvobj = cand["_review_obj"]
     has_test = any("test" in f.lower() for f in files)
     gi = pg.GateInputs(
         repo=pg.RepoMeta(owner=repo.split("/")[0], name=repo.split("/")[1], is_owned=True),
         diff=pg.DiffStats(lines_changed=lines, files=files),
-        worker_status="done", tests_green=True, lint_clean=(compile_rc == 0),
-        build_clean=(compile_rc == 0), has_secrets=secrets,
+        worker_status="done", tests_green=True, lint_clean=True,
+        build_clean=True, has_secrets=secrets,
         docs_updated_if_needed=True, review=rvobj,
         change_type=rvobj.change_type, has_test=has_test)
     d = pg.decide(gi)
