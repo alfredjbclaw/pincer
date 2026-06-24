@@ -56,6 +56,14 @@ All worker spawns go through `tools/runtime_adapter.py`. Never invoke `codex exe
 
 Dispatch a worker from a TOML plan item:
 
+**Usage gate (pre-dispatch).** Before each worker dispatch, check the subscription window so a long run never blows the cap mid-task. If the Codex 5-hour window OR 7-day week is ≥ 80%, do not dispatch — alert the owner and pause until reset.
+
+```bash
+if ! python3 ~/.openclaw/workspace/tools/usage_gate.py --provider codex --alert; then
+    echo "usage gate tripped (>=80%); pausing dispatch"; exit 0
+fi
+```
+
 ```bash
 python3 tools/runtime_adapter.py \
     --workdir "$repo_workdir" \
@@ -86,13 +94,46 @@ Decision matrix:
 
 | Sandbox verdict | Worker status | Orchestrator action |
 |---|---|---|
-| `pass` | `done` | Open PR. Worker output is the final artifact. |
+| `pass` | `done` | Run the **Publication Gate** (below). It decides auto-merge vs PR vs escalate — never open a PR directly on green. |
 | `pass` | `no_changes` | Close item with proof. No PR. |
 | `fail` | (any) | Return failure to worker with `stderr_tail` as additional constraint. Loop. |
 | `error` (crabbox_infra_failure) | (any) | Surface to owner as a system-level blocker. Do not open PR. Do not retry the worker. |
 | `error` (crabbox_not_installed / workdir_invalid) | (any) | Hard stop. Surface installation guidance to owner. |
 
 The sandbox gate is a **hard dependency**. If Crabbox is unavailable, the orchestrator pauses and surfaces the issue. It does NOT silently degrade to "no-sandbox mode" — that would defeat the purpose of the gate.
+
+## Publication Gate (verified completion → auto-merge or PR)
+
+A green sandbox verdict is necessary but **not sufficient** to publish. After `pass`/`done`, run two more stages before anything reaches `main`:
+
+### 1. Independent review (worker cannot grade its own homework)
+
+Spawn an independent reviewer that sees ONLY the diff + issue criteria — never the worker's reasoning or notepad. It runs Opus-4.8 with the codebase-memory graph scoped to its run (so it can ask "does this break callers elsewhere?").
+
+```bash
+python3 - <<'PY'
+import sys, json, subprocess
+sys.path.insert(0, "tools")
+from reviewer import review
+diff = subprocess.run(["git","-C",repo_workdir,"diff","main...HEAD"],capture_output=True,text=True).stdout
+v = review(diff, issue_body, PUBLICATION_CRITERIA, repo_workdir=repo_workdir)  # pass repo_workdir so memory sees the code
+print(json.dumps({"verdict": v.verdict, "blockers": v.blockers}))
+PY
+```
+
+`review()` fails **closed**: a timeout, non-zero exit, or unparseable verdict returns `reject`. A reject (or any blocker) means the change does not auto-merge.
+
+### 2. Trust gate (`tools/publication_gate.py`)
+
+Feed the worker result, test/lint/build state, a secret-scan result, and the reviewer verdict into `publication_gate.decide()`. It returns one of three actions:
+
+| `decide()` action | Meaning | Orchestrator does |
+|---|---|---|
+| `auto_merge` | Owned repo, all checks pass, not danger surface | Merge to `main`, post a one-line summary to the owner |
+| `escalate` | Owned repo, checks pass, but touches the **danger surface** (CI/CD, auth, billing, infra, config schema) | Open a PR + alert the owner — never auto-merge danger surface |
+| `open_pr` | Any gate failure, or a repo we do **not** own | Open a PR with the failing reasons in the body |
+
+The full criteria (eloquent code, generalizable, PII-stripped, novel, tested, reviewer-approved, secret-clean, builds/lints clean, docs updated, reversible) live in `publication_gate.py` as the single source of truth. Ownership — not public/private — decides auto-merge eligibility: repos we own are eligible; repos we don't own are always PR-only.
 
 ## Repository Scope
 
