@@ -204,6 +204,45 @@ def stage_review(cand: dict, repo: str, base_branch: str) -> dict:
     return cand
 
 
+def _stage_changes(wt: str) -> list[str]:
+    """Stage everything, drop scratch, return the real changed files."""
+    sh(["git", "-C", wt, "add", "-A"])
+    co, _, _ = sh(["git", "-C", wt, "diff", "--cached", "--name-only"])
+    staged = [f for f in co.split("\n") if f.strip()]
+    scratch = [f for f in staged if _is_scratch(f)]
+    if scratch:
+        sh(["git", "-C", wt, "reset", "-q", "--"] + scratch)
+    return [f for f in staged if not _is_scratch(f)]
+
+
+# --- Stage 3.5: revise rejected fixes once with the reviewer's blockers -----
+
+def stage_revise(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg) -> dict:
+    """One revision pass: hand the worker the reviewer's blockers, re-sandbox,
+    re-review. Turns 'rejected -> PR' into 'fixed -> merge' when the blockers
+    are addressable. Capped at one retry to avoid loops."""
+    wt = cand["worktree"]
+    rv_obj = cand.get("_review_obj")
+    if not rv_obj or not rv_obj.blockers:
+        return cand
+    title, brief = issue_brief(repo, cand["issue"])
+    revision = (brief + "\n\nAn independent reviewer REJECTED your previous fix on this branch. "
+                "Address ALL of these blockers, keep the change minimal, and make sure the "
+                "failing-first test still proves the fix:\n"
+                + "\n".join(f"- {b}" for b in rv_obj.blockers))
+    res = ra.dispatch(revision, workdir=wt, config=cfg)
+    changed = _stage_changes(wt)
+    if changed:
+        sh(["git", "-C", wt, "commit", "-q", "-m", f"Address review blockers: #{cand['issue']}"])
+        cand["changed"] = sorted(set(cand.get("changed", []) + changed))
+    cand["revised"] = True
+    cand["revise_runtime"] = res.runtime
+    # Re-verify: sandbox then review.
+    stage_sandbox(cand, test_cmd)
+    stage_review(cand, repo, base_branch)
+    return cand
+
+
 _SIGNIFICANCE_LABEL = {
     "important": "🔴 Important — user-facing / high impact",
     "inconsequential": "🟡 Inconsequential — minor effect",
@@ -359,6 +398,22 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     save()
     alert("🔎 Stage 3 REVIEW done — " +
           ", ".join("#%s:%s" % (c["issue"], c["review"]["verdict"]) for c in passed))
+
+    # Stage 3.5: revise rejected fixes once with the reviewer's blockers.
+    # Sandbox re-runs serialize on SANDBOX_LOCK; do these sequentially.
+    to_retry = [c for c in passed
+                if c.get("_review_obj") and c["_review_obj"].verdict != "approve"
+                and c["_review_obj"].blockers and not c.get("revised")]
+    if to_retry:
+        alert(f"♻️ Revising {len(to_retry)} rejected fix(es) with reviewer blockers: "
+              + ", ".join(f"#{c['issue']}" for c in to_retry))
+        for c in to_retry:
+            stage_revise(c, repo, base_branch, test_cmd, cfg)
+            state["candidates"][str(c["issue"])] = c
+            save()
+        flipped = sum(1 for c in to_retry if c["_review_obj"].verdict == "approve")
+        alert(f"♻️ Revision done — {flipped}/{len(to_retry)} now approved "
+              + ", ".join("#%s:%s" % (c["issue"], c["_review_obj"].verdict) for c in to_retry))
 
     # Stage 4: gate + publish (serial publish via lock)
     for c in passed:
