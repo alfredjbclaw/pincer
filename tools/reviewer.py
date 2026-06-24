@@ -79,12 +79,41 @@ def review(
             else:
                 restore_path.write_bytes(prior)
 
-    if exit_code != 0:
+    # Note: we deliberately do NOT gate on exit_code. The claude-code-wrapper
+    # (and acpx underneath) exit non-zero on a read-only review run for reasons
+    # unrelated to the review — acpx returns 5 on the locked-down path even on
+    # success, and the wrapper always wants a STATUS: marker a reviewer never
+    # emits. The model's real answer is in the wrapper's `final_text`. We fail
+    # closed only on a genuine timeout/agent-error or an unparseable verdict.
+    text = _final_text(stdout)
+    if text is None:
         return ReviewVerdict("reject", [PARSE_FAILURE])
-    verdict = _extract_verdict(stdout)
+    verdict = _extract_verdict(text)
     if verdict is None:
         return ReviewVerdict("reject", [PARSE_FAILURE])
     return verdict
+
+
+def _final_text(stdout: str) -> str | None:
+    """Return the model's answer text to parse, or None on a genuine failure.
+
+    Handles two shapes: the claude-code-wrapper JSON envelope (real use), and
+    raw marker text (unit tests / direct callers). Returns None — fail closed —
+    when the wrapper reports a real timeout or agent error.
+    """
+    stripped = stdout.strip()
+    try:
+        obj = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return stdout  # raw text path
+    if not isinstance(obj, dict):
+        return stdout
+    if obj.get("timed_out"):
+        return None
+    last_result = obj.get("last_result")
+    if isinstance(last_result, dict) and last_result.get("is_error"):
+        return None
+    return obj.get("final_text") or ""
 
 
 def _run_reviewer(cmd: ReviewerCommand) -> tuple[str, int]:

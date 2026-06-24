@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -87,6 +88,36 @@ def test_review_fails_closed_on_timeout(monkeypatch) -> None:
     verdict = reviewer.review("diff", "issue", "criteria")
 
     # Then: the gate rejects by default.
+    assert verdict.verdict == "reject"
+    assert verdict.blockers == ["reviewer did not return a parseable verdict"]
+
+
+def test_review_parses_wrapper_json_envelope_despite_nonzero_exit(monkeypatch) -> None:
+    # The real claude-code-wrapper returns a JSON envelope and a non-zero exit
+    # on read-only runs (acpx exit 5 / missing STATUS marker) even when the
+    # model answered. The verdict lives in final_text and must be honored.
+    envelope = json.dumps({
+        "ok": False,
+        "returncode": 5,
+        "timed_out": False,
+        "last_result": {"is_error": False},
+        "final_text": "VERDICT: approve\nREASONS: meets criteria\nBLOCKERS: none",
+    })
+
+    def fake_run(cmd) -> tuple[str, int]:
+        return (envelope, 5)  # non-zero exit, valid verdict inside
+
+    monkeypatch.setattr(reviewer, "_run_reviewer", fake_run)
+    verdict = reviewer.review("diff", "issue", "criteria")
+    assert verdict.verdict == "approve"
+    assert verdict.blockers == []
+
+
+def test_review_fails_closed_on_wrapper_timeout_envelope(monkeypatch) -> None:
+    envelope = json.dumps({"ok": False, "timed_out": True, "final_text": "VERDICT: approve\nREASONS: x\nBLOCKERS: none"})
+    monkeypatch.setattr(reviewer, "_run_reviewer", lambda cmd: (envelope, 124))
+    verdict = reviewer.review("diff", "issue", "criteria")
+    # Genuine timeout -> reject even though final_text looks approving.
     assert verdict.verdict == "reject"
     assert verdict.blockers == ["reviewer did not return a parseable verdict"]
 
