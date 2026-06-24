@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import dataclasses
 import json
 import subprocess
 import sys
@@ -280,7 +281,12 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     main_workdir = Path(workdir).resolve()
     base = main_workdir.parent / "pincer-worktrees"
     base.mkdir(exist_ok=True)
-    cfg = ra.RuntimeConfig.from_pincer_toml()
+    # ulw OFF for orchestrator workers: ulw insists on running the suite to prove
+    # RED->GREEN, but the worker sandbox can't install a real project's deps
+    # (sqlglot/pytest), so codex always blocks -> falls back to claude-code. Our
+    # Crabbox sandbox (installs deps) + independent reviewer do the real
+    # verification, so the worker just makes the change + writes a test fast.
+    cfg = dataclasses.replace(ra.RuntimeConfig.from_pincer_toml(), ultrawork=False)
     test_cmd = repo_test_cmd(main_workdir)
     base_branch = default_branch(main_workdir)
     state = {"repo": repo, "issues": issues, "base_branch": base_branch, "candidates": {}}
