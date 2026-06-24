@@ -99,6 +99,7 @@ class RuntimeConfig:
     primary: str = "codex"
     fallback: str = "claude-code"
     fallback_enabled: bool = True
+    ultrawork: bool = True
     codex_model: str = "gpt-5.5"
     claude_model: str = "claude-opus-4-6"
     codex_sandbox: str = "workspace-write"
@@ -126,6 +127,7 @@ class RuntimeConfig:
             primary=rt.get("primary", "codex"),
             fallback=rt.get("fallback", "claude-code"),
             fallback_enabled=bool(rt.get("fallback", "claude-code")),
+            ultrawork=bool(rt.get("ultrawork", True)),
             codex_model=codex_model,
         )
 
@@ -187,6 +189,7 @@ def _run_codex(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str
     """Invoke codex exec, return (last_message, combined_stderr, exit_code)."""
     if shutil.which("codex") is None:
         return ("", "codex CLI not found on PATH", 127)
+    worker_prompt = f"ulw: {prompt}" if cfg.ultrawork else prompt
     with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as last_msg_file:
         last_msg_path = Path(last_msg_file.name)
     try:
@@ -197,7 +200,7 @@ def _run_codex(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str
             "--model", cfg.codex_model,
             "--skip-git-repo-check",
             "--output-last-message", str(last_msg_path),
-            prompt + "\n\n" + WORKER_CONTRACT,
+            worker_prompt + "\n\n" + WORKER_CONTRACT,
         ]
         proc = subprocess.run(
             cmd,
