@@ -39,10 +39,21 @@ class RepoMeta:
     is_owned: bool
 
 
+# A diff bigger than this is treated as a "bigger change" → owner review, even
+# if the change_type wasn't explicitly classified as a feature.
+BIG_CHANGE_LINES: Final[int] = 120
+
+# change_type values that always route to the owner (PR) rather than auto-merge.
+OWNER_REVIEW_CHANGE_TYPES: Final[frozenset[str]] = frozenset({"feature", "big_change"})
+
+
 @dataclasses.dataclass(frozen=True)
 class ReviewVerdict:
     verdict: str
     blockers: list[str]
+    # Classification supplied by the reviewer (defaults keep older callers valid).
+    change_type: str = "bugfix"      # bugfix | adjustment | feature | big_change
+    significance: str = "background"  # important | inconsequential | background
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,6 +67,8 @@ class GateInputs:
     has_secrets: bool
     docs_updated_if_needed: bool
     review: ReviewVerdict
+    # bugfix/adjustment ship when confirmed; feature/big_change go to owner (PR).
+    change_type: str = "bugfix"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,7 +103,25 @@ def decide(inputs: GateInputs) -> GateDecision:
             reasons=[f"all checks passed; owned; danger surface: {', '.join(matched_files)}"],
             danger_surface=True,
         )
-    return GateDecision(action="auto_merge", reasons=["all checks passed; owned; non-danger"], danger_surface=False)
+    # Owner-review routing: features and bigger changes go to a PR even when
+    # clean. Only confirmed bug fixes / slight adjustments auto-merge.
+    if inputs.change_type in OWNER_REVIEW_CHANGE_TYPES:
+        return GateDecision(
+            action="escalate",
+            reasons=[f"all checks passed; owned; but change_type={inputs.change_type} → owner review (PR)"],
+            danger_surface=False,
+        )
+    if inputs.diff.lines_changed > BIG_CHANGE_LINES:
+        return GateDecision(
+            action="escalate",
+            reasons=[f"all checks passed; owned; but large diff ({inputs.diff.lines_changed} lines) → owner review (PR)"],
+            danger_surface=False,
+        )
+    return GateDecision(
+        action="auto_merge",
+        reasons=[f"all checks passed; owned; {inputs.change_type}; non-danger"],
+        danger_surface=False,
+    )
 
 
 def _production_ready_failures(inputs: GateInputs) -> list[str]:

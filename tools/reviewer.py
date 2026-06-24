@@ -185,8 +185,14 @@ def _review_prompt(*, diff: str, issue: str, criteria: str, mcp_config_path: Pat
             f"Scoped MCP config: {mcp_config_path}",
             "Return exactly this contract:",
             "VERDICT: <approve|reject>",
+            "CHANGE_TYPE: <bugfix|adjustment|feature|big_change>",
+            "SIGNIFICANCE: <important|inconsequential|background>",
             "REASONS: <one per line>",
             "BLOCKERS: <list or none>",
+            "",
+            "CHANGE_TYPE guidance: bugfix = corrects wrong behavior; adjustment = small "
+            "tweak/cleanup; feature = new capability; big_change = large/structural. "
+            "SIGNIFICANCE = user-facing impact if this ships.",
             "",
             "ISSUE:",
             issue,
@@ -210,7 +216,23 @@ def _extract_verdict(stdout: str) -> ReviewVerdict | None:
     blockers = _extract_blockers(stdout)
     if blockers is None:
         return None
-    return ReviewVerdict(verdict=verdict_match.group(1).casefold(), blockers=blockers)
+    return ReviewVerdict(
+        verdict=verdict_match.group(1).casefold(),
+        blockers=blockers,
+        change_type=_extract_field(stdout, "CHANGE_TYPE",
+                                   {"bugfix", "adjustment", "feature", "big_change"}, "bugfix"),
+        significance=_extract_field(stdout, "SIGNIFICANCE",
+                                    {"important", "inconsequential", "background"}, "background"),
+    )
+
+
+def _extract_field(stdout: str, name: str, allowed: set[str], default: str) -> str:
+    m = re.search(rf"^\s*{name}:\s*([a-z_]+)\s*$", stdout, re.IGNORECASE | re.MULTILINE)
+    if m:
+        val = m.group(1).casefold()
+        if val in allowed:
+            return val
+    return default
 
 
 def _extract_blockers(stdout: str) -> list[str] | None:

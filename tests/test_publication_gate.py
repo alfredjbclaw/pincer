@@ -27,10 +27,12 @@ def clean_inputs(
     has_secrets: bool = False,
     docs_updated_if_needed: bool = True,
     review: ReviewVerdict | None = None,
+    change_type: str = "bugfix",
+    lines_changed: int = 10,
 ) -> GateInputs:
     return GateInputs(
         repo=repo or RepoMeta(owner="alfredjbclaw", name="pincer", is_owned=True),
-        diff=DiffStats(lines_changed=10, files=files or ["tools/publication_gate.py"]),
+        diff=DiffStats(lines_changed=lines_changed, files=files or ["tools/publication_gate.py"]),
         worker_status=worker_status,
         tests_green=tests_green,
         lint_clean=lint_clean,
@@ -38,6 +40,7 @@ def clean_inputs(
         has_secrets=has_secrets,
         docs_updated_if_needed=docs_updated_if_needed,
         review=review or ReviewVerdict(verdict="approve", blockers=[]),
+        change_type=change_type,
     )
 
 
@@ -51,7 +54,26 @@ def test_decide_auto_merges_owned_clean_safe_diff() -> None:
     # Then: the change may auto-merge with an explanatory reason.
     assert decision.action == "auto_merge"
     assert decision.danger_surface is False
-    assert decision.reasons == ["all checks passed; owned; non-danger"]
+    assert decision.reasons == ["all checks passed; owned; bugfix; non-danger"]
+
+
+def test_decide_escalates_feature_change_to_owner() -> None:
+    # A clean, owned, non-danger FEATURE still goes to the owner as a PR.
+    decision = decide(clean_inputs(files=["src/calc.py"], change_type="feature"))
+    assert decision.action == "escalate"
+    assert decision.danger_surface is False
+    assert "change_type=feature" in decision.reasons[0]
+
+
+def test_decide_escalates_big_diff_even_when_bugfix() -> None:
+    decision = decide(clean_inputs(files=["src/calc.py"], change_type="bugfix", lines_changed=400))
+    assert decision.action == "escalate"
+    assert "large diff" in decision.reasons[0]
+
+
+def test_decide_auto_merges_small_adjustment() -> None:
+    decision = decide(clean_inputs(files=["src/calc.py"], change_type="adjustment", lines_changed=8))
+    assert decision.action == "auto_merge"
 
 
 def test_decide_escalates_owned_clean_danger_diff() -> None:
