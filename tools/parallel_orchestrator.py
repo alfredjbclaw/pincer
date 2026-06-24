@@ -147,17 +147,10 @@ def stage_code(repo: str, main_workdir: Path, base: Path, n: int, cfg, base_bran
     title, brief = issue_brief(repo, n)
     wt = make_worktree(main_workdir, base, n, base_branch)
     res = ra.dispatch(brief, workdir=wt, config=cfg)
-    # Worker left changes uncommitted (no-git contract). Stage everything, then
-    # unstage all worker scratch (ulw/codegraph notepads + evidence) so it never
-    # enters the diff. Do NOT touch .gitignore — that reads as unrelated scope
-    # creep and trips the reviewer.
-    sh(["git", "-C", str(wt), "add", "-A"])
-    co, _, _ = sh(["git", "-C", str(wt), "diff", "--cached", "--name-only"])
-    staged = [f for f in co.split("\n") if f.strip()]
-    scratch = [f for f in staged if _is_scratch(f)]
-    if scratch:
-        sh(["git", "-C", str(wt), "reset", "-q", "--"] + scratch)
-    changed = [f for f in staged if not _is_scratch(f)]
+    # Worker left changes uncommitted (no-git contract). _stage_changes stages
+    # everything and drops worker scratch so it never enters the diff. (Do NOT
+    # touch .gitignore — that reads as scope creep and trips the reviewer.)
+    changed = _stage_changes(str(wt))
     committed = False
     if changed:
         sh(["git", "-C", str(wt), "commit", "-q", "-m",
