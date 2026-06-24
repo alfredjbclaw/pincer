@@ -36,6 +36,9 @@ class ScopedMcpConfig:
     path: Path
     workdir: Path
     cleanup_dir: Path | None
+    # If set, (config_path, prior_bytes_or_None) — restore the repo's .mcp.json
+    # after the run: rewrite prior bytes, or unlink if there was no prior file.
+    restore: tuple[Path, bytes | None] | None = None
 
 
 def review(
@@ -43,11 +46,16 @@ def review(
     issue: str,
     criteria: str,
     *,
+    repo_workdir: str | None = None,
     model: str = "claude-opus-4-8",
     mcp_config_path: str | None = None,
     timeout: int = 900,
 ) -> ReviewVerdict:
-    scoped_config = _create_scoped_mcp_config(mcp_config_path)
+    # repo_workdir is the repo under review. Pass it in real use so the reviewer
+    # (and codebase-memory-mcp, discovered via .mcp.json in the cwd) can see the
+    # code. Without it, the reviewer runs in an empty temp dir with no graph —
+    # acceptable only for unit tests that mock the subprocess.
+    scoped_config = _create_scoped_mcp_config(mcp_config_path, repo_workdir)
     try:
         command = ReviewerCommand(
             argv=_build_command(
@@ -64,6 +72,12 @@ def review(
     finally:
         if scoped_config.cleanup_dir is not None:
             shutil.rmtree(scoped_config.cleanup_dir, ignore_errors=True)
+        if scoped_config.restore is not None:
+            restore_path, prior = scoped_config.restore
+            if prior is None:
+                restore_path.unlink(missing_ok=True)
+            else:
+                restore_path.write_bytes(prior)
 
     if exit_code != 0:
         return ReviewVerdict("reject", [PARSE_FAILURE])
@@ -105,23 +119,33 @@ def _build_command(*, model: str, scoped_config: ScopedMcpConfig, prompt: str, t
     )
 
 
-def _create_scoped_mcp_config(mcp_config_path: str | None) -> ScopedMcpConfig:
+def _scoped_mcp_payload() -> str:
+    return json.dumps(
+        {"mcpServers": {"codebase-memory": {"command": str(DEFAULT_MCP_BINARY), "args": []}}}
+    )
+
+
+def _create_scoped_mcp_config(mcp_config_path: str | None, repo_workdir: str | None) -> ScopedMcpConfig:
+    # Caller-supplied config path: run in the repo (if given) or the config's dir.
     if mcp_config_path is not None:
         config_path = Path(mcp_config_path)
-        return ScopedMcpConfig(path=config_path, workdir=config_path.parent, cleanup_dir=None)
+        workdir = Path(repo_workdir) if repo_workdir is not None else config_path.parent
+        return ScopedMcpConfig(path=config_path, workdir=workdir, cleanup_dir=None)
 
+    # Real use: place .mcp.json INTO the repo so claude (cwd=repo) discovers it
+    # and the memory graph sees the actual code. Back up any existing file.
+    if repo_workdir is not None:
+        workdir = Path(repo_workdir)
+        config_path = workdir / ".mcp.json"
+        prior = config_path.read_bytes() if config_path.exists() else None
+        config_path.write_text(_scoped_mcp_payload())
+        return ScopedMcpConfig(path=config_path, workdir=workdir, cleanup_dir=None,
+                               restore=(config_path, prior))
+
+    # No repo context (unit tests / probes): isolated temp dir, no graph.
     workdir = Path(tempfile.mkdtemp(prefix="pincer-reviewer-mcp-"))
     config_path = workdir / ".mcp.json"
-    config = {
-        "mcpServers": {
-            "codebase-memory": {
-                "command": str(DEFAULT_MCP_BINARY),
-                "args": [],
-            }
-        }
-    }
-    with config_path.open("w") as config_file:
-        json.dump(config, config_file)
+    config_path.write_text(_scoped_mcp_payload())
     return ScopedMcpConfig(path=config_path, workdir=workdir, cleanup_dir=workdir)
 
 

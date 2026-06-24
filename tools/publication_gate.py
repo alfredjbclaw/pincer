@@ -112,30 +112,31 @@ def _production_ready_failures(inputs: GateInputs) -> list[str]:
 
 
 def _matches_danger_pattern(file_path: str) -> bool:
+    """Match one path against DANGER_SURFACE_PATTERNS.
+
+    Pattern semantics (so the module constant is the single source of truth —
+    editing it actually changes behavior):
+      - trailing "/"  → directory substring match on the full path
+      - "**/X"        → glob X against any path segment
+      - contains * ?  → glob against basename or any segment
+      - plain literal → basename equals, or starts with, the literal
+    """
     normalized = file_path.replace("\\", "/").casefold()
     basename = normalized.rsplit("/", 1)[-1]
     segments = normalized.split("/")
-    return (
-        ".github/workflows/" in normalized
-        or any(segment.startswith("docker-compose") for segment in segments)
-        or any(_segment_matches(segment) for segment in segments)
-        or _basename_matches(basename)
-    )
-
-
-def _segment_matches(segment: str) -> bool:
-    return segment.startswith(("auth", "billing", "payment"))
-
-
-def _basename_matches(basename: str) -> bool:
-    return (
-        basename == "dockerfile"
-        or basename == "makefile"
-        or basename in {"pyproject.toml", "package.json", "config.toml", "settings.py"}
-        or fnmatch.fnmatchcase(basename, "*.tf")
-        or fnmatch.fnmatchcase(basename, "*.sql")
-        or fnmatch.fnmatchcase(basename, "requirements*.txt")
-        or fnmatch.fnmatchcase(basename, "*.service")
-        or fnmatch.fnmatchcase(basename, "*.plist")
-        or fnmatch.fnmatchcase(basename, ".env*")
-    )
+    for raw in DANGER_SURFACE_PATTERNS:
+        pat = raw.casefold()
+        if pat.endswith("/"):
+            if pat in normalized:
+                return True
+        elif pat.startswith("**/"):
+            sub = pat[3:]
+            if any(fnmatch.fnmatchcase(seg, sub) for seg in segments):
+                return True
+        elif "*" in pat or "?" in pat:
+            if fnmatch.fnmatchcase(basename, pat) or any(fnmatch.fnmatchcase(seg, pat) for seg in segments):
+                return True
+        else:
+            if basename == pat or basename.startswith(pat):
+                return True
+    return False

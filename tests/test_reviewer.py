@@ -91,6 +91,45 @@ def test_review_fails_closed_on_timeout(monkeypatch) -> None:
     assert verdict.blockers == ["reviewer did not return a parseable verdict"]
 
 
+def test_review_runs_in_repo_workdir_with_scoped_config(monkeypatch, tmp_path) -> None:
+    seen_cmd: list[str] = []
+    config_present_at_runtime: dict[str, bool] = {}
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def fake_run(cmd) -> tuple[str, int]:
+        seen_cmd.extend(cmd.argv)
+        # The scoped .mcp.json must exist IN the repo while the reviewer runs.
+        config_present_at_runtime["present"] = (repo / ".mcp.json").exists()
+        return ("VERDICT: approve\nREASONS: ok\nBLOCKERS: none", 0)
+
+    monkeypatch.setattr(reviewer, "_run_reviewer", fake_run)
+
+    verdict = reviewer.review("diff", "issue", "criteria", repo_workdir=str(repo))
+
+    # Then: ran with the repo as workdir, config present during the run...
+    assert verdict.verdict == "approve"
+    idx = seen_cmd.index("--workdir")
+    assert seen_cmd[idx + 1] == str(repo)
+    assert config_present_at_runtime["present"] is True
+    # ...and the repo is left clean afterward (no leftover .mcp.json).
+    assert not (repo / ".mcp.json").exists()
+
+
+def test_review_restores_preexisting_mcp_config(monkeypatch, tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".mcp.json").write_text('{"original": true}')
+
+    monkeypatch.setattr(reviewer, "_run_reviewer",
+                        lambda cmd: ("VERDICT: approve\nREASONS: ok\nBLOCKERS: none", 0))
+
+    reviewer.review("diff", "issue", "criteria", repo_workdir=str(repo))
+
+    # Then: the caller's original .mcp.json is restored byte-for-byte.
+    assert (repo / ".mcp.json").read_text() == '{"original": true}'
+
+
 def test_review_uses_overridable_mcp_config(monkeypatch, tmp_path) -> None:
     seen_cmd: list[str] = []
     mcp_config = tmp_path / "mcp.json"
