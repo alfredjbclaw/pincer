@@ -415,10 +415,16 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
             stage_revise(c, repo, base_branch, test_cmd, cfg, fb)
             state["candidates"][str(c["issue"])] = c
             save()
+            rev = c["review"]["verdict"] if isinstance(c.get("review"), dict) else "-"
+            alert(f"  ♻️ revised #{c['issue']} → sandbox={c.get('sandbox')}, review={rev}"
+                  + (" (no-op: worker couldn't address it)" if c.get("revise_noop") else ""))
     passed = [c for c in done if c.get("sandbox") == "pass"]
 
     # Stage 3: review — parallel (skip ones already reviewed during a revise)
     need_review = [c for c in passed if not c.get("_review_obj")]
+    if need_review:
+        alert(f"🔎 Reviewing {len(need_review)} candidate(s) (Opus reads the repo — "
+              f"a few min each): {', '.join('#%s' % c['issue'] for c in need_review)}")
     with cf.ThreadPoolExecutor(max_workers=max_coders) as ex:
         list(ex.map(lambda c: stage_review(c, repo, base_branch), need_review))
     for c in passed:
@@ -440,6 +446,8 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
             stage_revise(c, repo, base_branch, test_cmd, cfg, fb)
             state["candidates"][str(c["issue"])] = c
             save()
+            alert(f"  ♻️ revised #{c['issue']} → review={c['_review_obj'].verdict}"
+                  + (" (no-op)" if c.get("revise_noop") else ""))
         flipped = sum(1 for c in to_retry if c["_review_obj"].verdict == "approve")
         alert(f"♻️ Revision done — {flipped}/{len(to_retry)} now approved "
               + ", ".join("#%s:%s" % (c["issue"], c["_review_obj"].verdict) for c in to_retry))
