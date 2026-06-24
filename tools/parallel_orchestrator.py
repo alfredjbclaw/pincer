@@ -81,13 +81,26 @@ def issue_brief(repo: str, n: int) -> tuple[str, str]:
     return data["title"], brief
 
 
-def make_worktree(main_workdir: Path, base: Path, n: int) -> Path:
+def default_branch(main_workdir: Path) -> str:
+    """Detect the repo's default branch (main vs master vs ...)."""
+    out, _, rc = sh(["git", "-C", str(main_workdir), "symbolic-ref", "--short",
+                     "refs/remotes/origin/HEAD"])
+    if rc == 0 and out.strip():
+        return out.strip().split("/", 1)[-1]
+    for cand in ("main", "master"):
+        _, _, rc = sh(["git", "-C", str(main_workdir), "rev-parse", "--verify", cand])
+        if rc == 0:
+            return cand
+    return "main"
+
+
+def make_worktree(main_workdir: Path, base: Path, n: int, base_branch: str) -> Path:
     wt = base / f"wt-issue-{n}"
     with WORKTREE_LOCK:  # serialize only the shared-.git setup, not the coding
         sh(["git", "-C", str(main_workdir), "worktree", "remove", "--force", str(wt)])
         sh(["git", "-C", str(main_workdir), "branch", "-D", f"fix/issue-{n}"])
         _, err, rc = sh(["git", "-C", str(main_workdir), "worktree", "add", "-b",
-                         f"fix/issue-{n}", str(wt), "main"])
+                         f"fix/issue-{n}", str(wt), base_branch])
         if rc != 0:
             raise RuntimeError(f"worktree add failed for #{n}: {err}")
     return wt
@@ -95,9 +108,9 @@ def make_worktree(main_workdir: Path, base: Path, n: int) -> Path:
 
 # --- Stage 1: code (parallel) ----------------------------------------------
 
-def stage_code(repo: str, main_workdir: Path, base: Path, n: int, cfg) -> dict:
+def stage_code(repo: str, main_workdir: Path, base: Path, n: int, cfg, base_branch: str) -> dict:
     title, brief = issue_brief(repo, n)
-    wt = make_worktree(main_workdir, base, n)
+    wt = make_worktree(main_workdir, base, n, base_branch)
     res = ra.dispatch(brief, workdir=wt, config=cfg)
     # Worker left changes uncommitted (no-git contract). Stage everything, then
     # unstage ulw scratch so it never enters the diff. Do NOT touch .gitignore —
@@ -135,12 +148,12 @@ def stage_sandbox(cand: dict, test_cmd: str) -> dict:
 
 # --- Stage 3: review (parallel) --------------------------------------------
 
-def stage_review(cand: dict, repo: str) -> dict:
+def stage_review(cand: dict, repo: str, base_branch: str) -> dict:
     if cand.get("sandbox") != "pass":
         cand["review"] = {"verdict": "reject", "blockers": ["sandbox not green"]}
         return cand
     wt = cand["worktree"]
-    diff, _, _ = sh(["git", "-C", wt, "diff", "main...HEAD"])
+    diff, _, _ = sh(["git", "-C", wt, "diff", f"{base_branch}...HEAD"])
     criteria = ("Eloquent, generalizable, PII-free, novel, tested, builds clean, "
                 "minimal/scoped, docs updated if needed.")
     v = rv.review(diff, cand["title"], criteria, repo_workdir=wt, timeout=600)
@@ -185,12 +198,12 @@ def _pr_report(cand: dict, d, rvobj, lines: int, files: list[str]) -> str:
 
 # --- Stage 4: gate + publish (serial publish) ------------------------------
 
-def stage_gate(cand: dict, repo: str, main_workdir: Path, allow_merge: bool) -> dict:
+def stage_gate(cand: dict, repo: str, main_workdir: Path, allow_merge: bool, base_branch: str) -> dict:
     if cand.get("sandbox") != "pass" or "_review_obj" not in cand:
         cand["gate"] = {"action": "open_pr", "reasons": ["did not reach review"]}
         return cand
     wt = cand["worktree"]
-    diff, _, _ = sh(["git", "-C", wt, "diff", "main...HEAD"])
+    diff, _, _ = sh(["git", "-C", wt, "diff", f"{base_branch}...HEAD"])
     files = [f for f in cand["changed"]]
     lines = sum(1 for ln in diff.splitlines()
                 if ln[:1] in "+-" and not ln.startswith(("+++", "---")))
@@ -211,11 +224,11 @@ def stage_gate(cand: dict, repo: str, main_workdir: Path, allow_merge: bool) -> 
 
     branch = f"fix/issue-{cand['issue']}"
     if d.action == "auto_merge" and allow_merge:
-        with PUBLISH_LOCK:  # serialize merges to shared main
-            sh(["git", "-C", str(main_workdir), "checkout", "main"])
+        with PUBLISH_LOCK:  # serialize merges to shared default branch
+            sh(["git", "-C", str(main_workdir), "checkout", base_branch])
             sh(["git", "-C", str(main_workdir), "merge", "--no-ff", branch, "-m",
                 f"Merge #{cand['issue']}: {cand['title']} (auto-merged by pincer hybrid)"])
-            _, _, prc = sh(["git", "-C", str(main_workdir), "push", "origin", "main"])
+            _, _, prc = sh(["git", "-C", str(main_workdir), "push", "origin", base_branch])
             if prc == 0:
                 sh(["gh", "issue", "close", str(cand["issue"]), "-R", repo, "-c",
                     "Fixed and auto-merged to main by the pincer parallel loop."])
@@ -227,7 +240,7 @@ def stage_gate(cand: dict, repo: str, main_workdir: Path, allow_merge: bool) -> 
         sh(["git", "-C", wt, "push", "-q", "origin", branch])
         title = f"Fix #{cand['issue']}: {cand['title']}"
         body = _pr_report(cand, d, rvobj, lines, files)
-        sh(["gh", "pr", "create", "-R", repo, "--head", branch, "--base", "main",
+        sh(["gh", "pr", "create", "-R", repo, "--head", branch, "--base", base_branch,
             "--title", title, "--body", body])
         cand["published"] = f"pr_{d.action}"
         cand["significance"] = rvobj.significance
@@ -242,19 +255,20 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     base.mkdir(exist_ok=True)
     cfg = ra.RuntimeConfig.from_pincer_toml()
     test_cmd = repo_test_cmd(main_workdir)
-    state = {"repo": repo, "issues": issues, "candidates": {}}
+    base_branch = default_branch(main_workdir)
+    state = {"repo": repo, "issues": issues, "base_branch": base_branch, "candidates": {}}
     state_path = Path("/tmp/parallel-orchestrator-state.json")
 
     def save():
         state_path.write_text(json.dumps(state, indent=2, default=str))
 
-    alert(f"🧵 Parallel loop START — {repo} issues {issues}, up to {max_coders} coders in parallel. "
-          "Crabbox serialized; reviews parallel.")
+    alert(f"🧵 Parallel loop START — {repo} issues {issues}, up to {max_coders} coders in parallel "
+          f"(base branch: {base_branch}). Crabbox serialized; reviews parallel.")
 
     # Stage 1: code — parallel
     cands = []
     with cf.ThreadPoolExecutor(max_workers=max_coders) as ex:
-        futs = {ex.submit(stage_code, repo, main_workdir, base, n, cfg): n for n in issues}
+        futs = {ex.submit(stage_code, repo, main_workdir, base, n, cfg, base_branch): n for n in issues}
         for fut in cf.as_completed(futs):
             n = futs[fut]
             try:
@@ -279,7 +293,7 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
 
     # Stage 3: review — parallel
     with cf.ThreadPoolExecutor(max_workers=max_coders) as ex:
-        list(ex.map(lambda c: stage_review(c, repo), passed))
+        list(ex.map(lambda c: stage_review(c, repo, base_branch), passed))
     for c in passed:
         state["candidates"][str(c["issue"])] = c
     save()
@@ -288,7 +302,7 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
 
     # Stage 4: gate + publish (serial publish via lock)
     for c in passed:
-        stage_gate(c, repo, main_workdir, allow_merge)
+        stage_gate(c, repo, main_workdir, allow_merge, base_branch)
         state["candidates"][str(c["issue"])] = c
         save()
 
