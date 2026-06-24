@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Iterable, Optional
@@ -187,10 +188,37 @@ def _extract_contract(final_text: str) -> dict:
     return out
 
 
+# The ChatGPT (Codex) subscription throttles concurrent requests: firing 7+ at
+# once trips 429s and we'd dump good work onto claude-code. Cap simultaneous
+# codex calls (env-overridable) and back off + retry on a 429 before falling
+# back. Keeps codex primary under high fan-out.
+_CODEX_SEMAPHORE = threading.Semaphore(int(os.environ.get("PINCER_CODEX_CONCURRENCY", "4")))
+_CODEX_MAX_ATTEMPTS = 3
+_CODEX_BACKOFF_S = 8
+
+
+def _is_rate_limited(stderr: str, text: str) -> bool:
+    haystack = f"{stderr}\n{text}".lower()
+    return any(pat in haystack for pat in RATE_LIMIT_PATTERNS)
+
+
 def _run_codex(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str, int]:
-    """Invoke codex exec, return (last_message, combined_stderr, exit_code)."""
+    """Invoke codex exec (concurrency-capped, 429-retried). Returns (last_message, stderr, exit_code)."""
     if shutil.which("codex") is None:
         return ("", "codex CLI not found on PATH", 127)
+    result = ("", "no codex attempt", 1)
+    for attempt in range(_CODEX_MAX_ATTEMPTS):
+        with _CODEX_SEMAPHORE:  # never exceed the plan's concurrency
+            result = _codex_once(prompt, workdir, cfg)
+        text, stderr, _ = result
+        if not _is_rate_limited(stderr, text):
+            return result  # success or a non-rate-limit failure: don't retry
+        if attempt < _CODEX_MAX_ATTEMPTS - 1:
+            time.sleep(_CODEX_BACKOFF_S * (attempt + 1))  # 8s, 16s
+    return result  # exhausted retries -> caller falls back to claude-code
+
+
+def _codex_once(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str, int]:
     worker_prompt = f"ulw: {prompt}" if cfg.ultrawork else prompt
     with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as last_msg_file:
         last_msg_path = Path(last_msg_file.name)
@@ -204,15 +232,9 @@ def _run_codex(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str
             "--output-last-message", str(last_msg_path),
             worker_prompt + "\n\n" + WORKER_CONTRACT,
         ]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=cfg.timeout_seconds,
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg.timeout_seconds)
         last_message = last_msg_path.read_text() if last_msg_path.exists() else ""
-        combined_stderr = proc.stderr
-        return (last_message or proc.stdout, combined_stderr, proc.returncode)
+        return (last_message or proc.stdout, proc.stderr, proc.returncode)
     except subprocess.TimeoutExpired:
         return ("", f"codex exec timed out after {cfg.timeout_seconds}s", 124)
     finally:
