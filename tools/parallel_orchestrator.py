@@ -250,11 +250,15 @@ def stage_revise(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg, fe
                 "test still proves the fix without breaking other tests.")
     res = ra.dispatch(revision, workdir=wt, config=cfg)
     changed = _stage_changes(wt)
-    if changed:
-        sh(["git", "-C", wt, "commit", "-q", "-m", f"Address review feedback: #{cand['issue']}"])
-        cand["changed"] = sorted(set(cand.get("changed", []) + changed))
     cand["revised"] = True
     cand["revise_runtime"] = res.runtime
+    if not changed:
+        # Worker couldn't address the feedback — the code is identical, so a
+        # re-verify would burn a VM/review for the same result. Stop here.
+        cand["revise_noop"] = True
+        return cand
+    sh(["git", "-C", wt, "commit", "-q", "-m", f"Address review feedback: #{cand['issue']}"])
+    cand["changed"] = sorted(set(cand.get("changed", []) + changed))
     stage_sandbox(cand, test_cmd)
     stage_review(cand, repo, base_branch)
     return cand
