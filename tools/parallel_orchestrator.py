@@ -73,10 +73,46 @@ def repo_test_cmd(workdir: Path) -> str:
     return "python3 -m pytest -q"
 
 
-def issue_brief(repo: str, n: int) -> tuple[str, str]:
+_LOC_STOP = {"this", "that", "with", "from", "should", "when", "what", "have", "your",
+             "code", "issue", "error", "value", "values", "return", "returns", "result",
+             "expected", "actual", "test", "tests", "using", "into", "would", "could",
+             "does", "given", "list", "type", "case", "https", "github", "http"}
+
+
+def localize(workdir: str, issue_text: str, limit: int = 5) -> list[str]:
+    """Lexical bug localization (Agentless-style): grep the repo's source for the
+    issue's salient terms and rank files by how many distinct terms they hit.
+    Points the worker at the likely-relevant files instead of the whole repo.
+    Best-effort — returns [] on any error so it never breaks the pipeline."""
+    try:
+        import re
+        terms = {w.lower() for w in re.findall(r"[A-Za-z_]{4,}", issue_text)
+                 if w.lower() not in _LOC_STOP}
+        terms = list(terms)[:25]
+        if not terms:
+            return []
+        counts: dict[str, int] = {}
+        for t in terms:
+            out, _, _ = sh(["grep", "-rIl", "-iw", t, workdir,
+                            "--include=*.py", "--include=*.go", "--include=*.js",
+                            "--include=*.ts", "--include=*.rb", "--include=*.java"], timeout=30)
+            for f in out.splitlines():
+                if f.strip() and "/test" not in f.lower() and "_test." not in f.lower():
+                    rel = f[len(workdir):].lstrip("/") if f.startswith(workdir) else f
+                    counts[rel] = counts.get(rel, 0) + 1
+        ranked = sorted(counts, key=lambda k: counts[k], reverse=True)
+        return ranked[:limit]
+    except Exception:
+        return []
+
+
+def issue_brief(repo: str, n: int, workdir: str | None = None) -> tuple[str, str]:
     out, _, _ = sh(["gh", "issue", "view", str(n), "-R", repo, "--json", "title,body"])
     data = json.loads(out)
-    brief = (f"Fix {repo} issue #{n}: {data['title']}\n\n{data['body']}\n\n"
+    hints = localize(workdir, f"{data['title']} {data['body']}") if workdir else []
+    hint_line = (f"Likely-relevant files (from lexical localization — start here, verify): "
+                 f"{', '.join(hints)}\n\n" if hints else "")
+    brief = (f"Fix {repo} issue #{n}: {data['title']}\n\n{data['body']}\n\n{hint_line}"
              "Keep the change minimal and idiomatic. REQUIRED: add a test that captures "
              "this bug — one that FAILS on the current code and PASSES after your fix. If "
              "a matching xfail test exists, remove the xfail marker. You do NOT need to "
@@ -144,7 +180,7 @@ def usage_ok() -> bool:
 
 
 def stage_code(repo: str, main_workdir: Path, base: Path, n: int, cfg, base_branch: str) -> dict:
-    title, brief = issue_brief(repo, n)
+    title, brief = issue_brief(repo, n, workdir=str(main_workdir))
     wt = make_worktree(main_workdir, base, n, base_branch)
     res = ra.dispatch(brief, workdir=wt, config=cfg)
     # Worker left changes uncommitted (no-git contract). _stage_changes stages
@@ -237,7 +273,7 @@ def stage_revise(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg, fe
     into 'fixed -> merge' when addressable. Capped at one retry per candidate
     (the `revised` flag) so we adjust for slips without burning tokens in a loop."""
     wt = cand["worktree"]
-    _, brief = issue_brief(repo, cand["issue"])
+    _, brief = issue_brief(repo, cand["issue"], workdir=cand["worktree"])
     revision = (brief + "\n\n" + feedback
                 + "\nKeep the change minimal and narrow, and make sure the failing-first "
                 "test still proves the fix without breaking other tests.")
