@@ -16,13 +16,9 @@ from pathlib import Path
 
 THIS = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS))
-sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
 import parallel_orchestrator as po
 from loop_spec import LoopSpec, run_spec
-try:
-    from telegram_alert import send_alert
-except Exception:
-    def send_alert(m): print("[alert]", m)
+from notify import send_alert
 
 
 def _interval_seconds(schedule: str) -> int | None:

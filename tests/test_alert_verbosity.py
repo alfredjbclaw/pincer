@@ -4,14 +4,20 @@ chatter, the dedicated topic is applied, and config drives the level."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
-sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
+import pytest
 
-import telegram_alert as ta
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+
 import parallel_orchestrator as po
+
+# The first two tests exercise the real external alert backend's AlertThread
+# (verbosity floor + topic routing) and skip cleanly when it isn't installed
+# (the standalone public case). The make_alert_thread tests below cover pincer's
+# OWN config logic via the no-op shim and always run.
 
 
 def test_quiet_thread_suppresses_progress_keeps_milestone(monkeypatch):
+    ta = pytest.importorskip("telegram_alert")
     sent = []
     monkeypatch.setattr(ta, "send_alert", lambda body, **kw: (sent.append(kw), (True, "ok"))[1])
     th = ta.AlertThread("tag", topic_id=99, min_level="milestone")
@@ -26,6 +32,7 @@ def test_quiet_thread_suppresses_progress_keeps_milestone(monkeypatch):
 
 
 def test_verbose_thread_sends_everything(monkeypatch):
+    ta = pytest.importorskip("telegram_alert")
     sent = []
     monkeypatch.setattr(ta, "send_alert", lambda body, **kw: (sent.append(body), (True, "ok"))[1])
     th = ta.AlertThread("t", min_level="progress")

@@ -49,10 +49,10 @@ def cmd_list(a):
 def cmd_run(a):
     spec = LoopSpec.load(a.name)
     # fire detached so it survives, with a reporter that Telegrams the scorecard
-    runner = (f"import sys; sys.path.insert(0,'{THIS}'); sys.path.insert(0,'/Users/alfred/.openclaw/workspace/tools');"
+    runner = (f"import sys; sys.path.insert(0,{str(THIS)!r}); "
               f"from loop_spec import LoopSpec, run_spec; "
+              f"from notify import send_alert; "
               f"r=run_spec(LoopSpec.load('{a.name}')); "
-              f"from telegram_alert import send_alert; "
               f"send_alert('🏁 Loop '+repr('{a.name}')+' done: '+str(r))")
     log = f"/tmp/loop-{a.name}.log"
     subprocess.Popen(["nohup", "python3", "-c", runner],

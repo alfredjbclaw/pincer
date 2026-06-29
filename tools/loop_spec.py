@@ -23,22 +23,19 @@ Spec lives at ~/.openclaw/pincer/loops/<name>.json:
 }
 """
 from __future__ import annotations
-import json, subprocess, sys, dataclasses
+import os, json, subprocess, sys, dataclasses
 from pathlib import Path
 
 THIS = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS))
-sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
 import parallel_orchestrator as po
 import audit as audit_mod
 
 LOOPS_DIR = Path.home() / ".openclaw" / "pincer" / "loops"
-USAGE_GATE = "/Users/alfred/.openclaw/workspace/tools/usage_gate.py"
+# Optional external usage gate; set $PINCER_USAGE_GATE to its path to enable.
+USAGE_GATE = os.environ.get("PINCER_USAGE_GATE")
 
-try:
-    from telegram_alert import send_alert
-except Exception:
-    def send_alert(m): print("[alert]", m)
+from notify import send_alert
 
 
 @dataclasses.dataclass
@@ -78,6 +75,8 @@ class LoopSpec:
 def budget_ok(spec: LoopSpec) -> tuple[bool, str]:
     """Token-budget guardrail: halt the loop if codex usage crosses the spec's
     thresholds, so a run can't burn the window away."""
+    if not USAGE_GATE or not os.path.exists(USAGE_GATE):
+        return True, "budget check skipped (PINCER_USAGE_GATE unset/missing)"
     try:
         p = subprocess.run(["python3", USAGE_GATE, "--provider", "codex"],
                            capture_output=True, text=True, timeout=60)

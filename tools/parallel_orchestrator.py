@@ -32,7 +32,8 @@ from pathlib import Path
 
 THIS = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS))
-sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
+
+import os
 
 import runtime_adapter as ra
 import publication_gate as pg
@@ -41,11 +42,7 @@ import localization as lz
 import selection as sel
 import repro_test as rp
 
-try:
-    from telegram_alert import send_alert, AlertThread
-except Exception:  # pragma: no cover - alerts optional
-    def send_alert(msg): print("[alert]", msg)
-    AlertThread = None
+from notify import send_alert, AlertThread
 
 # All of a run's alerts thread under its "loop START" root (set in run()).
 _THREAD = None
@@ -288,11 +285,18 @@ def _is_scratch(path: str) -> bool:
 
 
 def usage_ok() -> bool:
-    """True if the Codex subscription window/week is under the halt threshold."""
+    """True if the Codex subscription window/week is under the halt threshold.
+
+    The gate is an optional external tool: set $PINCER_USAGE_GATE to its path.
+    If unset or absent, the gate is skipped (treated as safe to dispatch)."""
+    gate = os.environ.get("PINCER_USAGE_GATE")
+    if not gate or not os.path.exists(gate):
+        print("[debug] usage gate not configured (PINCER_USAGE_GATE unset/missing) — skipping")
+        return True
     try:
         rc = subprocess.run(
-            ["python3", "/Users/alfred/.openclaw/workspace/tools/usage_gate.py",
-             "--provider", "codex"], capture_output=True, timeout=60).returncode
+            ["python3", gate, "--provider", "codex"],
+            capture_output=True, timeout=60).returncode
         return rc != 2  # 2 == window/week >= 80%
     except Exception:
         return True  # fail open — never block on a gate error

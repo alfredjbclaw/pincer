@@ -16,14 +16,10 @@ import sys, json, subprocess, dataclasses
 import concurrent.futures as cf
 from pathlib import Path
 
-sys.path.insert(0, "/Users/alfred/Projects/pincer/tools")
-sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
+THIS = Path(__file__).resolve().parent
+sys.path.insert(0, str(THIS))
 import runtime_adapter as ra
-try:
-    from telegram_alert import send_alert, AlertThread
-except Exception:
-    def send_alert(m): print("[alert]", m)
-    AlertThread = None
+from notify import send_alert, AlertThread
 
 _THREAD = None
 
@@ -95,7 +91,7 @@ def build_module(mod):
             "runtime": res.runtime, "fallback": res.fallback_used}
 
 def vm_test():
-    out, err, rc = sh(["python3", "/Users/alfred/Projects/pincer/tools/sandbox_gate.py",
+    out, err, rc = sh(["python3", str(THIS / "sandbox_gate.py"),
                        "--workdir", REPO, "--test", GOTEST, "--json"], 1800)
     try:
         j = json.loads(out)

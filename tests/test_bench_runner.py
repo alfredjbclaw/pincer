@@ -3,7 +3,6 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
 
 import tools.bench.runner as rn
 from tools.bench.dataset import Instance

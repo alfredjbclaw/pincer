@@ -7,7 +7,6 @@ from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent.parent / "tools"
 sys.path.insert(0, str(TOOLS))
-sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
 
 import parallel_orchestrator as po
 from publication_gate import ReviewVerdict

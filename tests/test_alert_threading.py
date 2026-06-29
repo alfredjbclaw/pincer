@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
-sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
 
 import loop_spec as ls
 import loop_driver as ld
