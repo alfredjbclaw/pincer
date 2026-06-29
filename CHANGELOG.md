@@ -43,6 +43,27 @@ exactly. See `SELECTION.md`.
   out under a path containing `/test` filtered the entire tree. Now filters on
   the path relative to the workdir, and only matches real test dirs/modules.
 
+### SWE-bench harness plumbing (`tools/bench/`)
+
+Turns a Pincer run into official-harness predictions and grades them with the
+real SWE-bench evaluator (never Pincer's own sandbox). See `BENCH.md`.
+
+- `predictions.py` — `model_patch` = the literal `git diff` vs the checked-out
+  `base_commit` (the #1 apply-failure fix), test-file edits stripped, trailing
+  newline preserved; JSONL emit/read.
+- `dataset.py` — load instances from a local `.json/.jsonl` (no deps) or Hugging
+  Face (`datasets`, optional); handles the string-encoded FAIL/PASS_TO_PASS.
+- `runner.py` — one instance → clone @ `base_commit` → localization → `--samples`
+  coders → sandbox-ranked selection cascade → `model_patch`.
+- `grade.py` — official-harness argv builders + `preflight()` (flags missing
+  Docker, arm64 non-canonical images, missing `swebench`) + gold sanity run.
+- `run_lite.py` — CLI; writes predictions incrementally, grades only when Docker
+  preflight passes.
+
+Grading is Docker-only and canonical numbers need x86_64 — both flagged by
+preflight; this dev box (arm64, no Docker) can produce predictions but not a
+canonical graded score.
+
 ### Internal
 
 - `pytest.ini` scopes discovery to `tests/` (helper modules under `tools/` that
