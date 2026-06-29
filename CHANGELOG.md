@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — reliability: self-healing workdir + single alert thread
+
+Fixes two issues from the live sql-metadata loop runs.
+
+### Fixed
+
+- **Loop runs failed with `fatal: invalid reference: master` and nothing
+  started.** Root cause was a corrupted/purged `/tmp` clone whose default branch
+  no longer resolved — not model routing. Added `ensure_clone()`: before a run,
+  re-clone if the workdir is missing/broken, else fetch + hard-reset, returning a
+  default branch guaranteed to resolve. `default_branch()` now only returns a
+  name whose `origin/<name>` resolves, and `make_worktree()` falls back to
+  `origin/<branch>` if no local branch resolves. The orchestrator (and the audit
+  paths in loop_spec/oneshot) self-heal the workdir at the top of every run.
+- **Loop workdir moved off `/tmp`** to `~/.openclaw/pincer/clones/<name>` so a
+  `/tmp` purge can't break it (self-heal covers it regardless).
+
+### Changed
+
+- **Alert reply-threading across the board.** Every alert in a run now replies to
+  one root (the process's start message) instead of being its own message. A
+  single `AlertThread` is created at the outermost entry (loop driver tick /
+  oneshot) and threaded down through `loop_spec.run_spec` and
+  `parallel_orchestrator.run` (new `thread=` param) — so the driver tick, each
+  loop's START/done, and all orchestrator stage alerts form one Telegram
+  reply-chain.
+
 ## Unreleased — pre-bench selection cascade
 
 Test-grounded candidate **selection** added to the parallel orchestrator — the

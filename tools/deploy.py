@@ -4,7 +4,10 @@
 Create/manage/run portable loop specs. Deploying a new project is one command:
 
   deploy add --name sqlmeta --mode fix --repo alfredjbclaw/sql-metadata \
-      --workdir /tmp/sqlmeta --target all-issues --autonomy auto --schedule 6h
+      --workdir ~/.openclaw/pincer/clones/sqlmeta --target all-issues \
+      --autonomy auto --schedule 6h
+  # Use a persistent workdir, NOT /tmp — /tmp gets purged and the clone breaks.
+  # (The orchestrator self-heals via ensure_clone, but a stable path is cleaner.)
   deploy run sqlmeta          # fire once now (detached, Telegram-tracked)
   deploy list                 # see all deployed loops
   deploy enable/disable/remove sqlmeta

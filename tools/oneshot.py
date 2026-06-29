@@ -30,9 +30,10 @@ import parallel_orchestrator as po
 import audit as audit_mod
 
 try:
-    from telegram_alert import send_alert
+    from telegram_alert import send_alert, AlertThread
 except Exception:
     def send_alert(msg): print("[alert]", msg)
+    AlertThread = None
 
 
 def sh(cmd, timeout=120):
@@ -83,26 +84,33 @@ def main() -> int:
     ap.add_argument("--no-merge", action="store_true")
     a = ap.parse_args()
 
+    # One alert root for the whole oneshot — audit messages and the orchestrator
+    # stage alerts all reply to it.
+    thread = AlertThread(f"🎯 {a.repo.split('/')[-1]}") if AlertThread else None
+    post = thread.post if thread is not None else send_alert
+
     if a.audit:
-        send_alert(f"🔍 Oneshot AUDIT — scanning {a.repo} for real bugs…")
+        post(f"🔍 Oneshot AUDIT — scanning {a.repo} for real bugs…")
+        po.ensure_clone(a.repo, a.workdir, alert_fn=post)  # audit reads the workdir
         findings = audit_mod.audit_repo(a.workdir, a.max_findings)
         if not findings:
-            send_alert(f"✅ Oneshot: audit of {a.repo} found no fixable defects. Nothing to do.")
+            post(f"✅ Oneshot: audit of {a.repo} found no fixable defects. Nothing to do.")
             print("audit found no findings")
             return 0
         ensure_label(a.repo)
         issues = file_findings_as_issues(a.repo, findings)
-        send_alert(f"🔍 Audit filed {len(issues)} issue(s) on {a.repo}: "
-                   + ", ".join(f"#{n}" for n in issues) + ". Dispatching fixers…")
+        post(f"🔍 Audit filed {len(issues)} issue(s) on {a.repo}: "
+             + ", ".join(f"#{n}" for n in issues) + ". Dispatching fixers…")
     elif a.all_issues:
         issues = open_issue_numbers(a.repo)
         if not issues:
-            send_alert(f"✅ Oneshot: {a.repo} has no open issues.")
+            post(f"✅ Oneshot: {a.repo} has no open issues.")
             return 0
     else:
         issues = [int(x) for x in a.issues.split(",") if x.strip()]
 
-    state = po.run(a.repo, a.workdir, issues, a.max_coders, allow_merge=not a.no_merge)
+    state = po.run(a.repo, a.workdir, issues, a.max_coders,
+                   allow_merge=not a.no_merge, thread=thread)
 
     cands = state.get("candidates", {})
     merged = [k for k, c in cands.items() if c.get("published") == "auto_merged"]

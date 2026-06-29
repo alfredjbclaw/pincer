@@ -36,9 +36,10 @@ LOOPS_DIR = Path.home() / ".openclaw" / "pincer" / "loops"
 USAGE_GATE = "/Users/alfred/.openclaw/workspace/tools/usage_gate.py"
 
 try:
-    from telegram_alert import send_alert
+    from telegram_alert import send_alert, AlertThread
 except Exception:
     def send_alert(m): print("[alert]", m)
+    AlertThread = None
 
 
 @dataclasses.dataclass
@@ -120,20 +121,32 @@ def _resolve_issues(spec: LoopSpec) -> list[int]:
     return [int(x) for x in spec.target.split(",") if x.strip()]
 
 
-def run_spec(spec: LoopSpec) -> dict:
-    """Run one loop spec once: budget-gate -> resolve work -> proven pipeline -> report."""
+def run_spec(spec: LoopSpec, thread=None) -> dict:
+    """Run one loop spec once: budget-gate -> resolve work -> proven pipeline -> report.
+
+    `thread` (AlertThread): when the loop driver passes its thread, every alert
+    here AND inside the orchestrator replies to the driver's start message, so
+    the whole run is one Telegram reply-chain. Standalone, we start our own root."""
+    if thread is None and AlertThread is not None:
+        thread = AlertThread(f"🔁 {spec.name}")
+    post = thread.post if thread is not None else send_alert
+
     ok, why = budget_ok(spec)
     if not ok:
-        send_alert(f"⏸️ Loop '{spec.name}' held — {why}")
+        post(f"⏸️ Loop '{spec.name}' held — {why}")
         return {"name": spec.name, "result": "held_budget", "detail": why}
-    send_alert(f"🔁 Loop '{spec.name}' START — {spec.mode} on {spec.repo} ({why}).")
+    post(f"🔁 Loop '{spec.name}' START — {spec.mode} on {spec.repo} ({why}).")
 
+    # Audit reads the workdir before the orchestrator does, so heal the clone now
+    # (idempotent with the orchestrator's own ensure_clone for the fix path).
+    if spec.mode == "audit":
+        po.ensure_clone(spec.repo, spec.workdir, alert_fn=post)
     issues = _resolve_issues(spec)
     if not issues:
-        send_alert(f"✅ Loop '{spec.name}': nothing to do ({spec.mode} found no work).")
+        post(f"✅ Loop '{spec.name}': nothing to do ({spec.mode} found no work).")
         return {"name": spec.name, "result": "no_work"}
 
     state = po.run(spec.repo, spec.workdir, issues, spec.max_coders,
-                   allow_merge=(spec.autonomy == "auto"))
+                   allow_merge=(spec.autonomy == "auto"), thread=thread)
     return {"name": spec.name, "result": state.get("result"),
             "scorecard": state.get("scorecard", {})}

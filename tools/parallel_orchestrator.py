@@ -113,17 +113,86 @@ def issue_brief(repo: str, n: int, workdir: str | None = None,
     return title, brief
 
 
-def default_branch(main_workdir: Path) -> str:
-    """Detect the repo's default branch (main vs master vs ...)."""
-    out, _, rc = sh(["git", "-C", str(main_workdir), "symbolic-ref", "--short",
+def _resolves(workdir, ref: str) -> bool:
+    """True iff `ref` resolves to an actual commit in `workdir`."""
+    _, _, rc = sh(["git", "-C", str(workdir), "rev-parse", "--verify", "--quiet",
+                   f"{ref}^{{commit}}"])
+    return rc == 0
+
+
+def _detect_default_branch(workdir: Path) -> str | None:
+    """The repo's default branch *as a name whose origin/<name> actually
+    resolves to a commit*. Returns None if the clone is unhealthy (no resolvable
+    default) — that's the signal to re-clone. The old version returned a name
+    from origin/HEAD that could be a dangling ref (the cause of the
+    'invalid reference: master' crash on a corrupted /tmp clone)."""
+    out, _, rc = sh(["git", "-C", str(workdir), "symbolic-ref", "--short",
                      "refs/remotes/origin/HEAD"])
     if rc == 0 and out.strip():
-        return out.strip().split("/", 1)[-1]
+        name = out.strip().split("/", 1)[-1]
+        if _resolves(workdir, f"origin/{name}"):
+            return name
     for cand in ("main", "master"):
-        _, _, rc = sh(["git", "-C", str(main_workdir), "rev-parse", "--verify", cand])
-        if rc == 0:
+        if _resolves(workdir, f"origin/{cand}"):
             return cand
-    return "main"
+        if _resolves(workdir, cand):
+            return cand
+    return None
+
+
+def default_branch(main_workdir: Path) -> str:
+    """Detect the repo's default branch (main vs master vs ...), guaranteed to
+    resolve. Falls back to 'main' only when nothing resolves (callers should
+    have run ensure_clone first, which repairs that case)."""
+    return _detect_default_branch(main_workdir) or "main"
+
+
+def ensure_clone(repo: str, workdir, alert_fn=None, clone_url=None) -> str:
+    """Guarantee `workdir` is a healthy clone of `repo` with a resolvable
+    default branch, and return that branch name. Self-heals the failure that
+    sank the sql-metadata loop runs: a /tmp clone that got purged/corrupted so
+    `master` no longer resolved and every `git worktree add … master` died with
+    'invalid reference: master'.
+
+      - missing / not-a-repo / no resolvable default -> fresh clone
+      - otherwise -> fetch, then hard-reset the local default branch to origin
+
+    After this, a LOCAL branch named after the default exists and resolves, so
+    make_worktree can branch off it. Idempotent and cheap when already healthy."""
+    def say(m):
+        if alert_fn:
+            try:
+                alert_fn(m)
+            except Exception:
+                pass
+
+    wd = Path(workdir)
+    healthy = False
+    if (wd / ".git").exists():
+        sh(["git", "-C", str(wd), "fetch", "--quiet", "--prune", "origin"], timeout=600)
+        if _detect_default_branch(wd) is not None:
+            healthy = True
+
+    if not healthy:
+        say(f"🧹 Workdir {wd} is missing/broken — re-cloning {repo} fresh.")
+        import shutil
+        shutil.rmtree(wd, ignore_errors=True)
+        wd.parent.mkdir(parents=True, exist_ok=True)
+        url = clone_url or f"https://github.com/{repo}.git"
+        _, err, rc = sh(["git", "clone", "--quiet", url, str(wd)], timeout=1800)
+        if rc != 0:
+            raise RuntimeError(f"clone of {repo} failed: {err}")
+
+    branch = _detect_default_branch(wd)
+    if branch is None:
+        raise RuntimeError(f"{repo} clone at {wd} has no resolvable default branch")
+
+    # Make sure a local branch exists, points at origin, and is checked out, so
+    # worktrees can branch off it. Prune any stale worktree registrations.
+    sh(["git", "-C", str(wd), "checkout", "-B", branch, f"origin/{branch}"])
+    sh(["git", "-C", str(wd), "reset", "--hard", f"origin/{branch}"])
+    sh(["git", "-C", str(wd), "worktree", "prune"])
+    return branch
 
 
 def make_worktree(main_workdir: Path, base: Path, slug: str, base_branch: str) -> tuple[Path, str]:
@@ -132,11 +201,22 @@ def make_worktree(main_workdir: Path, base: Path, slug: str, base_branch: str) -
     candidate per issue. Returns (worktree_path, branch_name)."""
     wt = base / f"wt-issue-{slug}"
     branch = f"fix/issue-{slug}"
+    # Pick a base that actually resolves: the local branch, else origin/<branch>.
+    # Guards against the 'invalid reference: master' failure when only the
+    # remote-tracking ref exists.
+    base_ref = base_branch
+    if not _resolves(main_workdir, base_ref):
+        if _resolves(main_workdir, f"origin/{base_branch}"):
+            base_ref = f"origin/{base_branch}"
+        else:
+            raise RuntimeError(
+                f"base branch '{base_branch}' does not resolve in {main_workdir} "
+                "(clone unhealthy — ensure_clone should have repaired it)")
     with WORKTREE_LOCK:  # serialize only the shared-.git setup, not the coding
         sh(["git", "-C", str(main_workdir), "worktree", "remove", "--force", str(wt)])
         sh(["git", "-C", str(main_workdir), "branch", "-D", branch])
         _, err, rc = sh(["git", "-C", str(main_workdir), "worktree", "add", "-b",
-                         branch, str(wt), base_branch])
+                         branch, str(wt), base_ref])
         if rc != 0:
             raise RuntimeError(f"worktree add failed for {slug}: {err}")
     return wt, branch
@@ -554,9 +634,21 @@ def finalize_chosen(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg,
 
 
 def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge: bool,
-        tuning: "SelectionTuning | None" = None):
+        tuning: "SelectionTuning | None" = None, thread=None):
     tuning = tuning or SelectionTuning.load()
     main_workdir = Path(workdir).resolve()
+    samples = max(1, tuning.samples)
+    # Thread every alert under one root. If a parent (loop driver / spec) handed
+    # us its thread, reuse it so the whole run is one Telegram reply-chain;
+    # otherwise start our own root here.
+    global _THREAD
+    _THREAD = thread if thread is not None else (
+        AlertThread(f"🔧 {repo.split('/')[-1]}") if AlertThread else None)
+
+    # Self-heal the workdir BEFORE anything reads it: re-clone if missing/broken,
+    # else fetch + hard-reset. Returns a default branch guaranteed to resolve.
+    # This is the fix for the 'invalid reference: master' run failures.
+    base_branch = ensure_clone(repo, main_workdir, alert_fn=alert)
     base = main_workdir.parent / "pincer-worktrees"
     base.mkdir(exist_ok=True)
     # ulw OFF for orchestrator workers: ulw insists on running the suite to prove
@@ -566,10 +658,6 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     # verification, so the worker just makes the change + writes a test fast.
     cfg = dataclasses.replace(ra.RuntimeConfig.from_pincer_toml(), ultrawork=False)
     test_cmd = repo_test_cmd(main_workdir)
-    base_branch = default_branch(main_workdir)
-    samples = max(1, tuning.samples)
-    global _THREAD
-    _THREAD = AlertThread(f"🔧 {repo.split('/')[-1]}") if AlertThread else None
     state = {"repo": repo, "issues": issues, "base_branch": base_branch,
              "tuning": dataclasses.asdict(tuning), "candidates": {}, "selection": {}}
     state_path = Path("/tmp/parallel-orchestrator-state.json")
