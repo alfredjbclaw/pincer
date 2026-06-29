@@ -30,10 +30,9 @@ import parallel_orchestrator as po
 import audit as audit_mod
 
 try:
-    from telegram_alert import send_alert, AlertThread
+    from telegram_alert import send_alert
 except Exception:
     def send_alert(msg): print("[alert]", msg)
-    AlertThread = None
 
 
 def sh(cmd, timeout=120):
@@ -84,27 +83,32 @@ def main() -> int:
     ap.add_argument("--no-merge", action="store_true")
     a = ap.parse_args()
 
-    # One alert root for the whole oneshot — audit messages and the orchestrator
-    # stage alerts all reply to it.
-    thread = AlertThread(f"🎯 {a.repo.split('/')[-1]}") if AlertThread else None
-    post = thread.post if thread is not None else send_alert
+    # One alert root for the whole oneshot, routed to the muteable Pincer topic —
+    # audit messages and the orchestrator stage alerts all reply to it.
+    thread = po.make_alert_thread(f"🎯 {a.repo.split('/')[-1]}")
+
+    def post(msg, level="progress"):
+        if thread is not None:
+            thread.post(msg, level=level)
+        else:
+            send_alert(msg)
 
     if a.audit:
-        post(f"🔍 Oneshot AUDIT — scanning {a.repo} for real bugs…")
+        post(f"🔍 Oneshot AUDIT — scanning {a.repo} for real bugs…", "milestone")
         po.ensure_clone(a.repo, a.workdir, alert_fn=post)  # audit reads the workdir
         findings = audit_mod.audit_repo(a.workdir, a.max_findings)
         if not findings:
-            post(f"✅ Oneshot: audit of {a.repo} found no fixable defects. Nothing to do.")
+            post(f"✅ Oneshot: audit of {a.repo} found no fixable defects. Nothing to do.", "milestone")
             print("audit found no findings")
             return 0
         ensure_label(a.repo)
         issues = file_findings_as_issues(a.repo, findings)
         post(f"🔍 Audit filed {len(issues)} issue(s) on {a.repo}: "
-             + ", ".join(f"#{n}" for n in issues) + ". Dispatching fixers…")
+             + ", ".join(f"#{n}" for n in issues) + ". Dispatching fixers…", "milestone")
     elif a.all_issues:
         issues = open_issue_numbers(a.repo)
         if not issues:
-            post(f"✅ Oneshot: {a.repo} has no open issues.")
+            post(f"✅ Oneshot: {a.repo} has no open issues.", "milestone")
             return 0
     else:
         issues = [int(x) for x in a.issues.split(",") if x.strip()]

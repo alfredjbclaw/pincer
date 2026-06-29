@@ -93,6 +93,20 @@ interpret_failures = true
 # Model used to author reproduction tests + interpret failures.
 repro_model = "anthropic/claude-opus-4-8"
 
+[alerts]
+# Where pincer posts run progress, and how chatty it is. By default everything
+# goes to a dedicated, muteable "Pincer" Telegram topic (not the shared Alerts
+# topic) so a run never spams the phone — mute that topic and check it when you
+# want.
+topic_id = 1101
+
+# verbosity:
+#   "quiet"   (default) — milestones + criticals only (loop START / DONE / held,
+#             plus 🚨 INFRA FAILURE and crashes). ~2 messages per run.
+#   "verbose" — every stage + per-candidate line. A debug feed; turn on when
+#             diagnosing a loop, off the rest of the time.
+verbosity = "quiet"
+
 [cadence]
 mission = "daily"
 goal    = "hourly"

@@ -56,7 +56,7 @@ def test_run_spec_starts_own_thread_when_standalone(monkeypatch):
     monkeypatch.setattr(ls.po, "run", fake_run)
     monkeypatch.setattr(ls, "budget_ok", lambda s: (True, "ok"))
     monkeypatch.setattr(ls, "_resolve_issues", lambda s: [1])
-    monkeypatch.setattr(ls, "AlertThread", FakeThread)
+    monkeypatch.setattr(ls.po, "make_alert_thread", lambda tag: FakeThread(tag))
 
     spec = ls.LoopSpec(name="solo", mode="fix", repo="o/r", workdir="/tmp/x",
                        target="1", max_coders=2)
@@ -84,7 +84,7 @@ def test_loop_driver_threads_all_loops_under_one_root(monkeypatch):
 
     specs = [FakeSpec("a"), FakeSpec("b")]
     monkeypatch.setattr(ld, "run_spec", fake_run_spec)
-    monkeypatch.setattr(ld, "AlertThread", FakeThread)
+    monkeypatch.setattr(ld.po, "make_alert_thread", lambda tag: FakeThread(tag))
     monkeypatch.setattr(ld.LoopSpec, "all", staticmethod(lambda: specs))
     monkeypatch.setattr(ld, "is_due", lambda s, now: True)
     monkeypatch.setattr(sys, "argv", ["loop_driver"])

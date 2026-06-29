@@ -50,6 +50,42 @@ except Exception:  # pragma: no cover - alerts optional
 # All of a run's alerts thread under its "loop START" root (set in run()).
 _THREAD = None
 
+# Dedicated, muteable 'Pincer' forum topic — keeps pincer's run chatter out of
+# the shared Alerts topic so it never spams the phone. Override via [alerts] in
+# pincer.toml.
+PINCER_ALERTS_TOPIC = 1101
+
+
+def _alerts_config():
+    """(topic_id, verbosity) from [alerts] in pincer.toml. Defaults: the
+    dedicated Pincer topic + 'quiet' (milestones + criticals only)."""
+    topic, verbosity = PINCER_ALERTS_TOPIC, "quiet"
+    try:
+        import os
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore
+        p = Path(os.environ.get("PINCER_CONFIG", Path.home() / ".openclaw" / "pincer.toml"))
+        if p.exists():
+            a = tomllib.loads(p.read_text()).get("alerts", {})
+            topic = int(a.get("topic_id", topic))
+            verbosity = str(a.get("verbosity", verbosity))
+    except Exception:
+        pass
+    return topic, verbosity
+
+
+def make_alert_thread(tag):
+    """Build a run's AlertThread routed to the Pincer topic at the configured
+    verbosity. quiet -> milestones + criticals only; verbose -> everything (a
+    debug feed). Returns None if alerts are unavailable."""
+    if AlertThread is None:
+        return None
+    topic, verbosity = _alerts_config()
+    min_level = "progress" if verbosity == "verbose" else "milestone"
+    return AlertThread(tag, topic_id=topic, min_level=min_level)
+
 # The Crabbox stage is the only hard-serial section (host memory ceiling).
 SANDBOX_LOCK = threading.Lock()
 PUBLISH_LOCK = threading.Lock()   # git merge to the shared main must serialize
@@ -61,10 +97,10 @@ def sh(cmd, cwd=None, timeout=1800):
     return p.stdout, p.stderr, p.returncode
 
 
-def alert(msg):
+def alert(msg, level="progress"):
     try:
         if _THREAD is not None:
-            _THREAD.post(msg)
+            _THREAD.post(msg, level=level)
         else:
             send_alert(msg)
     except Exception as e:
@@ -657,8 +693,7 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     # us its thread, reuse it so the whole run is one Telegram reply-chain;
     # otherwise start our own root here.
     global _THREAD
-    _THREAD = thread if thread is not None else (
-        AlertThread(f"🔧 {repo.split('/')[-1]}") if AlertThread else None)
+    _THREAD = thread if thread is not None else make_alert_thread(f"🔧 {repo.split('/')[-1]}")
 
     # Self-heal the workdir BEFORE anything reads it: re-clone if missing/broken,
     # else fetch + hard-reset. Returns a default branch guaranteed to resolve.
@@ -681,7 +716,8 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
         state_path.write_text(json.dumps(state, indent=2, default=str))
 
     if not usage_ok():
-        alert("⏸️ Usage gate ≥80% — holding the loop before dispatch. Will not burn the window.")
+        alert("⏸️ Usage gate ≥80% — holding the loop before dispatch. Will not burn the window.",
+              level="milestone")
         state["result"] = "halted_usage"
         save()
         return state
@@ -690,7 +726,8 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
             if samples > 1 else "1 candidate/issue")
     alert(f"🧵 Parallel loop START — {repo} issues {issues}, up to {max_coders} coders "
           f"in parallel ({mode}; revise≤{tuning.max_revise_iters}; "
-          f"repro={'on' if tuning.repro_tests else 'off'}; base: {base_branch}).")
+          f"repro={'on' if tuning.repro_tests else 'off'}; base: {base_branch}).",
+          level="milestone")
 
     # Stage 1: code — parallel over (issue × sample). Each candidate gets its own
     # worktree; multiple samples per issue feed the selection cascade.
@@ -791,12 +828,12 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
                       if c.get("error") or c.get("sandbox_fail")), "")
         alert(f"🚨 INFRA FAILURE — {len(infra)}/{len(cands)} candidate(s) couldn't even be "
               f"built/tested (not 'no fix found'). Likely a pincer/env problem worth a look. "
-              f"First error: {str(first)[:300]}")
+              f"First error: {str(first)[:300]}", level="critical")
     alert(f"🏁 Parallel loop DONE — {len(merged)} merged, {len(prd)} PR'd, "
           f"{len(failed)} failed verification, {len(no_winner)} with no winning candidate"
           + (f", {len(infra)} INFRA failure(s)" if infra else "") + ". "
           + " | ".join("#%s:%s" % (c["issue"], c.get("published") or c.get("sandbox", "?"))
-                       for c in chosen))
+                       for c in chosen), level="milestone")
     save()
     return state
 

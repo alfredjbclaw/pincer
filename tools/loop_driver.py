@@ -17,12 +17,12 @@ from pathlib import Path
 THIS = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS))
 sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
+import parallel_orchestrator as po
 from loop_spec import LoopSpec, run_spec
 try:
-    from telegram_alert import send_alert, AlertThread
+    from telegram_alert import send_alert
 except Exception:
     def send_alert(m): print("[alert]", m)
-    AlertThread = None
 
 
 def _interval_seconds(schedule: str) -> int | None:
@@ -86,13 +86,21 @@ def main():
 
     import os
     lock.write_text(str(os.getpid()))
-    # One alert root for the whole tick: every loop's messages (and the
-    # orchestrator's stage alerts inside them) reply to this start message, so
-    # the entire run is a single Telegram reply-chain instead of a scatter of
-    # standalone messages.
-    thread = AlertThread("⏰ pincer") if AlertThread else None
-    post = thread.post if thread is not None else send_alert
+    # One alert root for the whole tick (routed to the muteable Pincer topic at
+    # the configured verbosity): every loop's messages — and the orchestrator's
+    # stage alerts inside them — reply to this root, so the entire run is a
+    # single Telegram reply-chain instead of a scatter of standalone messages.
+    thread = po.make_alert_thread("⏰ pincer")
+
+    def post(msg, level="progress"):
+        if thread is not None:
+            thread.post(msg, level=level)
+        else:
+            send_alert(msg)
+
     try:
+        # Tick framing is detail (the per-loop START/DONE milestones carry the
+        # signal); a crash is critical.
         post(f"⏰ Loop driver: {len(due)} loop(s) due — {', '.join(s.name for s in due)}")
         results = []
         for spec in due:
@@ -102,7 +110,7 @@ def main():
                 import traceback
                 traceback.print_exc()
                 r = {"name": spec.name, "result": "exception", "detail": str(e)}
-                post(f"💥 Loop '{spec.name}' crashed: {e}")
+                post(f"💥 Loop '{spec.name}' crashed: {e}", "critical")
             spec.last_run = now.isoformat()
             spec.save()
             results.append(r)

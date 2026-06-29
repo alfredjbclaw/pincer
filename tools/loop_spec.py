@@ -36,10 +36,9 @@ LOOPS_DIR = Path.home() / ".openclaw" / "pincer" / "loops"
 USAGE_GATE = "/Users/alfred/.openclaw/workspace/tools/usage_gate.py"
 
 try:
-    from telegram_alert import send_alert, AlertThread
+    from telegram_alert import send_alert
 except Exception:
     def send_alert(m): print("[alert]", m)
-    AlertThread = None
 
 
 @dataclasses.dataclass
@@ -127,14 +126,21 @@ def run_spec(spec: LoopSpec, thread=None) -> dict:
     `thread` (AlertThread): when the loop driver passes its thread, every alert
     here AND inside the orchestrator replies to the driver's start message, so
     the whole run is one Telegram reply-chain. Standalone, we start our own root."""
-    if thread is None and AlertThread is not None:
-        thread = AlertThread(f"🔁 {spec.name}")
-    post = thread.post if thread is not None else send_alert
+    if thread is None:
+        thread = po.make_alert_thread(f"🔁 {spec.name}")
+
+    def post(msg, level="progress"):
+        if thread is not None:
+            thread.post(msg, level=level)
+        else:
+            send_alert(msg)
 
     ok, why = budget_ok(spec)
     if not ok:
-        post(f"⏸️ Loop '{spec.name}' held — {why}")
+        post(f"⏸️ Loop '{spec.name}' held — {why}", "milestone")
         return {"name": spec.name, "result": "held_budget", "detail": why}
+    # The orchestrator emits its own START milestone; keep this one as detail so
+    # quiet mode isn't redundant.
     post(f"🔁 Loop '{spec.name}' START — {spec.mode} on {spec.repo} ({why}).")
 
     # Audit reads the workdir before the orchestrator does, so heal the clone now
@@ -143,7 +149,7 @@ def run_spec(spec: LoopSpec, thread=None) -> dict:
         po.ensure_clone(spec.repo, spec.workdir, alert_fn=post)
     issues = _resolve_issues(spec)
     if not issues:
-        post(f"✅ Loop '{spec.name}': nothing to do ({spec.mode} found no work).")
+        post(f"✅ Loop '{spec.name}': nothing to do ({spec.mode} found no work).", "milestone")
         return {"name": spec.name, "result": "no_work"}
 
     state = po.run(spec.repo, spec.workdir, issues, spec.max_coders,
