@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased — reliability: self-healing workdir + single alert thread
+## 0.2.0 — 2026-06-29
+
+Standalone portability, live-run reliability, a pre-bench selection cascade, and SWE-bench harness plumbing.
+
+### Standalone portability (public release)
+
+- **Removed every hardcoded workspace path and made the two private integrations optional plugins**, so Pincer now runs from a fresh clone with no external setup.
+  - **Alerting** loads through a new `tools/notify.py` shim: it uses a real backend if `$PINCER_NOTIFY_MODULE` (or an importable `telegram_alert`) is present, otherwise falls back to a stdout no-op with the same `send_alert` / `AlertThread` interface — alert call sites are unchanged.
+  - **Codex usage gate** is now opt-in via `$PINCER_USAGE_GATE` (path to the gate script); when unset or missing it is skipped and treated as safe-to-dispatch (fail-open), never blocking a run.
+
+### Reliability: self-healing workdir + single alert thread
 
 Fixes two issues from the live sql-metadata loop runs.
 
@@ -27,7 +37,7 @@ Fixes two issues from the live sql-metadata loop runs.
   loop's START/done, and all orchestrator stage alerts form one Telegram
   reply-chain.
 
-## Unreleased — pre-bench selection cascade
+### Pre-bench selection cascade
 
 Test-grounded candidate **selection** added to the parallel orchestrator — the
 lever the SWE-bench literature identifies as the binding constraint (coverage
