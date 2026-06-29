@@ -39,9 +39,13 @@ import publication_gate as pg
 import reviewer as rv
 
 try:
-    from telegram_alert import send_alert
+    from telegram_alert import send_alert, AlertThread
 except Exception:  # pragma: no cover - alerts optional
     def send_alert(msg): print("[alert]", msg)
+    AlertThread = None
+
+# All of a run's alerts thread under its "loop START" root (set in run()).
+_THREAD = None
 
 # The Crabbox stage is the only hard-serial section (host memory ceiling).
 SANDBOX_LOCK = threading.Lock()
@@ -56,7 +60,10 @@ def sh(cmd, cwd=None, timeout=1800):
 
 def alert(msg):
     try:
-        send_alert(msg)
+        if _THREAD is not None:
+            _THREAD.post(msg)
+        else:
+            send_alert(msg)
     except Exception as e:
         print("alert failed:", e)
 
@@ -396,6 +403,8 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     cfg = dataclasses.replace(ra.RuntimeConfig.from_pincer_toml(), ultrawork=False)
     test_cmd = repo_test_cmd(main_workdir)
     base_branch = default_branch(main_workdir)
+    global _THREAD
+    _THREAD = AlertThread(f"🔧 {repo.split('/')[-1]}") if AlertThread else None
     state = {"repo": repo, "issues": issues, "base_branch": base_branch, "candidates": {}}
     state_path = Path("/tmp/parallel-orchestrator-state.json")
 

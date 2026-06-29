@@ -20,9 +20,12 @@ sys.path.insert(0, "/Users/alfred/Projects/pincer/tools")
 sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
 import runtime_adapter as ra
 try:
-    from telegram_alert import send_alert
+    from telegram_alert import send_alert, AlertThread
 except Exception:
     def send_alert(m): print("[alert]", m)
+    AlertThread = None
+
+_THREAD = None
 
 # Plan-driven: pass --plan <json> to build any project; defaults to cfgcheck.
 # Plan schema: {repo_dir, state_path, test_cmd, modules: [[name, files, task], ...]}
@@ -69,8 +72,13 @@ def sh(cmd, timeout=1800):
     return p.stdout, p.stderr, p.returncode
 
 def alert(m):
-    try: send_alert(m)
-    except Exception as e: print("alert fail", e)
+    try:
+        if _THREAD is not None:
+            _THREAD.post(m)
+        else:
+            send_alert(m)
+    except Exception as e:
+        print("alert fail", e)
 
 state = {"phase": "start", "modules": {}, "rounds": []}
 def save(): STATE.write_text(json.dumps(state, indent=2, default=str))
@@ -107,8 +115,10 @@ def fix_round(failures, rnd):
     res = ra.dispatch(brief, workdir=REPO, config=CFG)
     return res.runtime
 
+_PROJECT = Path(REPO).name
 try:
-    alert(f"🏗️ FLEET BUILD START — recreating `cfgcheck` (Go config-validator) with {len(MODULES)} "
+    _THREAD = AlertThread(f"🏗️ {_PROJECT}") if AlertThread else None
+    alert(f"🏗️ FLEET BUILD START — building `{_PROJECT}` with {len(MODULES)} "
           "parallel codex builders against an Opus contract. We own the test env (no git/CI quirks).")
     state["phase"] = "build"; save()
 
