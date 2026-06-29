@@ -554,6 +554,21 @@ def cand_id(c: dict) -> str:
     return str(c["issue"]) if not s else f"{c['issue']}-s{s}"
 
 
+def infra_failures(cands: list) -> list:
+    """Candidates that failed for INFRASTRUCTURE reasons — couldn't be built or
+    tested at all — as opposed to 'a fix was attempted but didn't resolve it'.
+
+    worker_status == 'error'  -> worktree/clone/dispatch crash (e.g. the
+                                 'invalid reference: master' failure).
+    sandbox     == 'error'    -> VM/dep/network problem (not a test failure a
+                                 code edit could fix).
+
+    A whole loop of these means a pincer/env problem worth a human's eyes, not a
+    quiet 'no winner'."""
+    return [c for c in cands
+            if c.get("worker_status") == "error" or c.get("sandbox") == "error"]
+
+
 def _cascade_reviewer(repo: str, base_branch: str):
     """Adapter: the selection cascade's tie-breaker. Runs the real Opus review
     (populating _review_obj for reuse downstream) and returns approve? — called
@@ -760,13 +775,26 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     prd = [c for c in publishable if str(c.get("published", "")).startswith("pr")]
     failed = [c for c in chosen if c.get("sandbox") not in ("pass", None)]
     no_winner = [n for n in issues if n not in {c["issue"] for c in chosen}]
+    infra = infra_failures(cands)
     state["result"] = "done"
     state["scorecard"] = {"merged": [c["issue"] for c in merged],
                           "prd": [c["issue"] for c in prd],
                           "failed_verification": [c["issue"] for c in failed],
-                          "no_winner": no_winner}
+                          "no_winner": no_winner,
+                          "infra_failures": sorted({c["issue"] for c in infra})}
+    # Loud escalation: if NOTHING shipped and the cause was infrastructure (not
+    # "no fix found"), this is a pincer/env problem — say so plainly instead of a
+    # quiet 'no winner'. This is exactly what the sql-metadata clone failure
+    # needed: an immediate, unmistakable signal rather than a silent 6-hourly no-op.
+    if (len(merged) + len(prd)) == 0 and infra:
+        first = next((c.get("error") or c.get("sandbox_fail") for c in infra
+                      if c.get("error") or c.get("sandbox_fail")), "")
+        alert(f"🚨 INFRA FAILURE — {len(infra)}/{len(cands)} candidate(s) couldn't even be "
+              f"built/tested (not 'no fix found'). Likely a pincer/env problem worth a look. "
+              f"First error: {str(first)[:300]}")
     alert(f"🏁 Parallel loop DONE — {len(merged)} merged, {len(prd)} PR'd, "
-          f"{len(failed)} failed verification, {len(no_winner)} with no winning candidate. "
+          f"{len(failed)} failed verification, {len(no_winner)} with no winning candidate"
+          + (f", {len(infra)} INFRA failure(s)" if infra else "") + ". "
           + " | ".join("#%s:%s" % (c["issue"], c.get("published") or c.get("sandbox", "?"))
                        for c in chosen))
     save()

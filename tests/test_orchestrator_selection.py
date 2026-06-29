@@ -74,3 +74,16 @@ def test_revise_feedback_none_when_rejected_without_blockers():
     cand = {"sandbox": "pass", "_review_obj": ReviewVerdict("reject", [])}
     # no actionable blockers -> nothing to feed back
     assert po._revise_feedback(cand, "owner/repo", interpret=False) is None
+
+
+def test_infra_failures_classifies_setup_vs_no_fix():
+    cands = [
+        {"issue": 1, "worker_status": "error", "error": "worktree add failed"},  # infra
+        {"issue": 2, "sandbox": "error"},                                        # infra
+        {"issue": 3, "worker_status": "done", "committed": False},               # no fix found
+        {"issue": 4, "sandbox": "fail"},                                          # real test failure
+        {"issue": 5, "sandbox": "pass"},                                          # fine
+    ]
+    infra = po.infra_failures(cands)
+    issues = sorted(c["issue"] for c in infra)
+    assert issues == [1, 2]  # only the build/test-setup failures, not 'fail' or 'no fix'
