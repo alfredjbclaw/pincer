@@ -61,6 +61,38 @@ max_concurrent = 1
 # worker's expected ceiling. Default: 30 minutes.
 idle_timeout = "30m"
 
+[selection]
+# Candidate selection + execution-feedback tuning. The defaults below reproduce
+# Pincer's original cheap maintainer loop EXACTLY (one candidate per issue, one
+# revise pass, no reproduction tests). Turn these up for benchmark-grade quality
+# (e.g. SWE-bench), where the research shows selection — not generation — is the
+# ceiling: coverage runs ~70-80% but realized score ~57-66%, and the gap is
+# which candidate gets picked.
+
+# Candidate coders fanned out PER ISSUE. >1 produces N independent fixes for the
+# same bug; the selection cascade (regression rank -> reproduction-test flip ->
+# AST-normalized majority vote -> Opus reviewer tie-break) picks the winner.
+# Cost scales ~linearly with samples. Default: 1 (no fan-out, cascade no-ops).
+samples = 1
+
+# Bounded execution-feedback loop depth. Each round feeds the worker
+# critic-interpreted feedback (Opus reads the failing test, not raw stderr) and
+# re-verifies. The literature uses 5-8. Default: 1 (original single-shot revise).
+max_revise_iters = 1
+
+# Generate a fail-to-pass reproduction test per issue, validate it actually
+# fails on the unpatched base, then prefer candidates that flip it. Highest-ROI
+# verifier in the literature (~2x selection precision) but heavy: one extra
+# sandbox VM run per candidate, serialized. Default: off.
+repro_tests = false
+
+# When revising, prepend an Opus root-cause reading of the failure to the
+# worker feedback. Default: on (cheap, only fires during a revise).
+interpret_failures = true
+
+# Model used to author reproduction tests + interpret failures.
+repro_model = "anthropic/claude-opus-4-8"
+
 [cadence]
 mission = "daily"
 goal    = "hourly"

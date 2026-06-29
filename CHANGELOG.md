@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased — pre-bench selection cascade
+
+Test-grounded candidate **selection** added to the parallel orchestrator — the
+lever the SWE-bench literature identifies as the binding constraint (coverage
+~70-80% vs realized ~57-66%; the gap is *which candidate gets picked*). All new
+behavior is **opt-in**; the defaults reproduce the original one-candidate loop
+exactly. See `SELECTION.md`.
+
+### New
+
+- **Per-issue candidate multiplicity** — `--samples K` (config `[selection].samples`)
+  fans out K independent coders for the *same* issue (own worktree/branch each).
+  The original loop was issue-parallel with one candidate per issue; a selection
+  cascade needs >1 candidate to choose among.
+- **Selection cascade** (`tools/selection.py`) — picks one winner per issue with
+  execution-grounded signals first, the LLM judge last: regression rank →
+  reproduction-test flip → AST-normalized majority vote → Opus reviewer
+  tie-break. Each stage narrows the tier and is never allowed to empty it. The
+  winning `stage` is recorded as the selection-gap diagnostic.
+- **Structured test results** (`tools/test_results.py`) — pytest output parsed
+  into pass/fail/error counts + failed-test names so candidates are *ranked* by
+  how many previously-passing tests they break (PASS_TO_PASS analog), not just
+  gated pass/fail. Threaded through `sandbox_gate.SandboxVerdict.results`.
+- **Reproduction tests** (`tools/repro_test.py`) — generate a fail-to-pass test
+  per issue, **validate it actually fails on the unpatched base**, then prefer
+  candidates that flip it. Off by default (`[selection].repro_tests`); heavy
+  (one extra sandbox run per candidate). Noisy tests are discarded, never a hard
+  gate — falls back to regression-only ranking.
+- **Hierarchical localization** (`tools/localization.py`) — the flat grep-rank is
+  now layered with an AST symbol skeleton (def/class signatures ranked by
+  issue-term overlap, camelCase-aware), feeding the worker brief file *and*
+  symbol leads.
+- **Bounded execution-feedback loop** — `--max-revise-iters N` (default 1)
+  generalizes the single-shot revise into an N-round fix→sandbox→review loop,
+  each round prepending an Opus root-cause reading of the failure
+  (`reviewer.interpret_failure`) instead of echoing raw stderr.
+
+### Fixed
+
+- Localization test-file filter applied to the absolute path, so a repo checked
+  out under a path containing `/test` filtered the entire tree. Now filters on
+  the path relative to the workdir, and only matches real test dirs/modules.
+
+### Internal
+
+- `pytest.ini` scopes discovery to `tests/` (helper modules under `tools/` that
+  match `test_*.py` are no longer mis-collected).
+
 ## 0.1.0 — 2026-06-15
 
 First public release. Renamed from `openclaw-maintainer-skills` to `pincer` and expanded from a 2-skill steipete port into a 4-skill composed pipeline implementing a five-tier autonomous maintainer loop with Crabbox-gated sandbox validation.

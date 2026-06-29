@@ -35,6 +35,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import test_results as tr
+
 PINCER_CONFIG_DEFAULT = Path.home() / ".openclaw" / "pincer.toml"
 TAIL_BYTES = 4000
 
@@ -76,9 +79,14 @@ class SandboxVerdict:
     stdout_tail: str
     stderr_tail: str
     error_kind: Optional[str]  # only set when verdict=="error"
+    # Structured test counts parsed from the run, for regression-aware ranking
+    # in the selection cascade. parsed=False on infra errors / non-pytest output.
+    results: Optional["tr.TestResults"] = None
 
     def to_dict(self) -> dict:
-        return dataclasses.asdict(self)
+        d = dataclasses.asdict(self)
+        d["results"] = self.results.to_dict() if self.results is not None else None
+        return d
 
 
 def _tail(s: str, n: int = TAIL_BYTES) -> str:
@@ -147,6 +155,9 @@ def gate(
     duration = time.monotonic() - started
     stdout_tail = _tail(proc.stdout)
     stderr_tail = _tail(proc.stderr)
+    # Parse structured counts from the *full* output (the summary line lives at
+    # the very end, so even a tail keeps it — but parse the full blob to be safe).
+    results = tr.parse(proc.stdout + "\n" + proc.stderr, exit_code=proc.returncode)
 
     if proc.returncode == 0:
         return SandboxVerdict(
@@ -158,6 +169,7 @@ def gate(
             stdout_tail=stdout_tail,
             stderr_tail=stderr_tail,
             error_kind=None,
+            results=results,
         )
 
     # Distinguish "test failed" (verdict=fail) from "crabbox itself failed"
@@ -190,6 +202,7 @@ def gate(
             stdout_tail=stdout_tail,
             stderr_tail=stderr_tail,
             error_kind=None,
+            results=results,
         )
 
     return SandboxVerdict(

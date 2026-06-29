@@ -94,6 +94,56 @@ def review(
     return verdict
 
 
+def interpret_failure(
+    failure_text: str,
+    issue: str,
+    *,
+    repo_workdir: str | None = None,
+    model: str = "claude-opus-4-8",
+    timeout: int = 300,
+    _runner=None,
+) -> str | None:
+    """Critic-interpreted execution feedback: before the coder regenerates, have
+    Opus read the failing test output and say *what went wrong and what to
+    change* — the literature finds this beats echoing raw stderr back.
+
+    Best-effort: returns concise guidance, or None on any failure (the caller
+    then falls back to the raw failure text). `_runner(argv) -> str` is
+    injectable so the loop logic is testable without shelling out.
+    """
+    if not failure_text or not failure_text.strip():
+        return None
+    prompt = "\n".join([
+        "A candidate code fix just failed verification. Read the failing output "
+        "and explain, in 2-3 sentences of plain prose, the most likely root cause "
+        "and what the fix should change. Be concrete and specific. No code blocks, "
+        "no preamble.",
+        "",
+        "ISSUE BEING FIXED:",
+        issue,
+        "",
+        "FAILING OUTPUT:",
+        failure_text,
+    ])
+    argv = (
+        "python3", str(DEFAULT_WRAPPER),
+        "--workdir", repo_workdir or str(Path.cwd()),
+        "--read-only", "--model", model,
+        "--timeout", str(timeout), "--no-default-contract",
+        prompt,
+    )
+    try:
+        runner = _runner or (lambda a: subprocess.run(
+            a, capture_output=True, text=True, timeout=timeout).stdout)
+        out = runner(argv)
+    except Exception:
+        return None
+    text = _final_text(out)
+    if not text or not text.strip():
+        return None
+    return text.strip()[:1200]
+
+
 def _final_text(stdout: str) -> str | None:
     """Return the model's answer text to parse, or None on a genuine failure.
 

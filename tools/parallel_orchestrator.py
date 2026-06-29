@@ -37,6 +37,9 @@ sys.path.insert(0, "/Users/alfred/.openclaw/workspace/tools")
 import runtime_adapter as ra
 import publication_gate as pg
 import reviewer as rv
+import localization as lz
+import selection as sel
+import repro_test as rp
 
 try:
     from telegram_alert import send_alert, AlertThread
@@ -80,52 +83,34 @@ def repo_test_cmd(workdir: Path) -> str:
     return "python3 -m pytest -q"
 
 
-_LOC_STOP = {"this", "that", "with", "from", "should", "when", "what", "have", "your",
-             "code", "issue", "error", "value", "values", "return", "returns", "result",
-             "expected", "actual", "test", "tests", "using", "into", "would", "could",
-             "does", "given", "list", "type", "case", "https", "github", "http"}
-
-
-def localize(workdir: str, issue_text: str, limit: int = 5) -> list[str]:
-    """Lexical bug localization (Agentless-style): grep the repo's source for the
-    issue's salient terms and rank files by how many distinct terms they hit.
-    Points the worker at the likely-relevant files instead of the whole repo.
-    Best-effort — returns [] on any error so it never breaks the pipeline."""
-    try:
-        import re
-        terms = {w.lower() for w in re.findall(r"[A-Za-z_]{4,}", issue_text)
-                 if w.lower() not in _LOC_STOP}
-        terms = list(terms)[:25]
-        if not terms:
-            return []
-        counts: dict[str, int] = {}
-        for t in terms:
-            out, _, _ = sh(["grep", "-rIl", "-iw", t, workdir,
-                            "--include=*.py", "--include=*.go", "--include=*.js",
-                            "--include=*.ts", "--include=*.rb", "--include=*.java"], timeout=30)
-            for f in out.splitlines():
-                if f.strip() and "/test" not in f.lower() and "_test." not in f.lower():
-                    rel = f[len(workdir):].lstrip("/") if f.startswith(workdir) else f
-                    counts[rel] = counts.get(rel, 0) + 1
-        ranked = sorted(counts, key=lambda k: counts[k], reverse=True)
-        return ranked[:limit]
-    except Exception:
-        return []
-
-
-def issue_brief(repo: str, n: int, workdir: str | None = None) -> tuple[str, str]:
+def _issue_text(repo: str, n: int) -> tuple[str, str]:
+    """(title, body) for an issue — also the raw text fed to localization/repro."""
     out, _, _ = sh(["gh", "issue", "view", str(n), "-R", repo, "--json", "title,body"])
     data = json.loads(out)
-    hints = localize(workdir, f"{data['title']} {data['body']}") if workdir else []
-    hint_line = (f"Likely-relevant files (from lexical localization — start here, verify): "
-                 f"{', '.join(hints)}\n\n" if hints else "")
-    brief = (f"Fix {repo} issue #{n}: {data['title']}\n\n{data['body']}\n\n{hint_line}"
+    return data["title"], data.get("body") or ""
+
+
+def issue_brief(repo: str, n: int, workdir: str | None = None,
+                sample: int = 0) -> tuple[str, str]:
+    """Build the worker brief for issue #n. Hierarchical localization (files +
+    AST symbol skeleton) points the worker at the likely fix sites. `sample` is
+    the candidate index when fanning out >1 coder per issue — it only nudges
+    exploration diversity; it does not change what's asked."""
+    title, body = _issue_text(repo, n)
+    hint_block = ""
+    if workdir:
+        hint_block = lz.localize(workdir, f"{title} {body}").hint_block()
+    diversify = ""
+    if sample > 0:
+        diversify = (f"\n(Independent attempt #{sample + 1} at this fix — explore a "
+                     "different approach if the obvious one looks fragile.)\n")
+    brief = (f"Fix {repo} issue #{n}: {title}\n\n{body}\n\n{hint_block}{diversify}"
              "Keep the change minimal and idiomatic. REQUIRED: add a test that captures "
              "this bug — one that FAILS on the current code and PASSES after your fix. If "
              "a matching xfail test exists, remove the xfail marker. You do NOT need to "
              "run the suite yourself — a sandbox with the project's deps installed will "
              "run it. Just make the fix and include the failing-first test.")
-    return data["title"], brief
+    return title, brief
 
 
 def default_branch(main_workdir: Path) -> str:
@@ -141,16 +126,27 @@ def default_branch(main_workdir: Path) -> str:
     return "main"
 
 
-def make_worktree(main_workdir: Path, base: Path, n: int, base_branch: str) -> Path:
-    wt = base / f"wt-issue-{n}"
+def make_worktree(main_workdir: Path, base: Path, slug: str, base_branch: str) -> tuple[Path, str]:
+    """Create an isolated worktree + branch for a candidate. `slug` is the issue
+    number for a single-sample run ("3"), or "3-s1" etc. when fanning out >1
+    candidate per issue. Returns (worktree_path, branch_name)."""
+    wt = base / f"wt-issue-{slug}"
+    branch = f"fix/issue-{slug}"
     with WORKTREE_LOCK:  # serialize only the shared-.git setup, not the coding
         sh(["git", "-C", str(main_workdir), "worktree", "remove", "--force", str(wt)])
-        sh(["git", "-C", str(main_workdir), "branch", "-D", f"fix/issue-{n}"])
+        sh(["git", "-C", str(main_workdir), "branch", "-D", branch])
         _, err, rc = sh(["git", "-C", str(main_workdir), "worktree", "add", "-b",
-                         f"fix/issue-{n}", str(wt), base_branch])
+                         branch, str(wt), base_branch])
         if rc != 0:
-            raise RuntimeError(f"worktree add failed for #{n}: {err}")
-    return wt
+            raise RuntimeError(f"worktree add failed for {slug}: {err}")
+    return wt, branch
+
+
+def _capture_patch(wt: str, base_branch: str) -> str:
+    """The candidate's source diff vs the base branch — used by the selection
+    cascade (AST-normalized vote) and the publication report."""
+    diff, _, _ = sh(["git", "-C", wt, "diff", f"{base_branch}...HEAD"])
+    return diff
 
 
 # --- Stage 1: code (parallel) ----------------------------------------------
@@ -186,22 +182,26 @@ def usage_ok() -> bool:
         return True  # fail open — never block on a gate error
 
 
-def stage_code(repo: str, main_workdir: Path, base: Path, n: int, cfg, base_branch: str) -> dict:
-    title, brief = issue_brief(repo, n, workdir=str(main_workdir))
-    wt = make_worktree(main_workdir, base, n, base_branch)
+def stage_code(repo: str, main_workdir: Path, base: Path, n: int, cfg, base_branch: str,
+               sample: int = 0, samples: int = 1) -> dict:
+    title, brief = issue_brief(repo, n, workdir=str(main_workdir), sample=sample)
+    slug = str(n) if samples == 1 else f"{n}-s{sample}"
+    wt, branch = make_worktree(main_workdir, base, slug, base_branch)
     res = ra.dispatch(brief, workdir=wt, config=cfg)
     # Worker left changes uncommitted (no-git contract). _stage_changes stages
     # everything and drops worker scratch so it never enters the diff. (Do NOT
     # touch .gitignore — that reads as scope creep and trips the reviewer.)
     changed = _stage_changes(str(wt))
     committed = False
+    patch = ""
     if changed:
-        sh(["git", "-C", str(wt), "commit", "-q", "-m",
-            f"Fix #{n}: {title}"])
+        sh(["git", "-C", str(wt), "commit", "-q", "-m", f"Fix #{n}: {title}"])
         committed = True
-    return {"issue": n, "title": title, "worktree": str(wt), "worker_status": res.status,
-            "runtime": res.runtime, "fallback": res.fallback_used, "changed": changed,
-            "committed": committed}
+        patch = _capture_patch(str(wt), base_branch)
+    return {"issue": n, "sample": sample, "title": title, "worktree": str(wt),
+            "branch": branch, "worker_status": res.status, "runtime": res.runtime,
+            "fallback": res.fallback_used, "changed": changed, "committed": committed,
+            "patch": patch}
 
 
 # --- Stage 2: sandbox (SERIAL via lock) ------------------------------------
@@ -216,9 +216,11 @@ def stage_sandbox(cand: dict, test_cmd: str) -> dict:
     try:
         j = json.loads(out)
         cand["sandbox"] = j.get("verdict", "error")
+        cand["results"] = j.get("results")  # structured counts for regression ranking
         cand["sandbox_fail"] = _extract_test_failure(j.get("stdout_tail", "") + "\n" + j.get("stderr_tail", ""))
     except Exception:
         cand["sandbox"] = "error"
+        cand["results"] = None
         cand["sandbox_fail"] = (err or out)[-500:]
     return cand
 
@@ -233,13 +235,6 @@ def _extract_test_failure(blob: str) -> str:
             and not any(noise in ln for noise in ("crabbox", "lease", "provision", "rsync", "debconf"))]
     summary = keep[-12:] if keep else lines[-8:]
     return "\n".join(summary)[:1200]
-
-
-def _retryable_sandbox(verdict: str) -> bool:
-    """Tests ran and some failed (a fixable regression) -> retry. An infra
-    'error' (VM/dep/network) is NOT something a code edit can fix -> don't burn
-    tokens retrying it."""
-    return verdict == "fail"
 
 
 # --- Stage 3: review (parallel) --------------------------------------------
@@ -274,29 +269,71 @@ def _stage_changes(wt: str) -> list[str]:
 
 # --- Stage 3.5: revise rejected fixes once with the reviewer's blockers -----
 
-def stage_revise(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg, feedback: str) -> dict:
-    """One revision pass: hand the worker concrete feedback (a test regression or
-    the reviewer's blockers), re-sandbox, re-review. Turns 'failed/rejected -> PR'
-    into 'fixed -> merge' when addressable. Capped at one retry per candidate
-    (the `revised` flag) so we adjust for slips without burning tokens in a loop."""
+def _revise_once(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg,
+                 feedback: str) -> bool:
+    """One revision pass: hand the worker concrete feedback, re-sandbox,
+    re-review, refresh the patch. Returns True iff the worker actually changed
+    something (False == no-op: identical code, no point re-verifying)."""
     wt = cand["worktree"]
     _, brief = issue_brief(repo, cand["issue"], workdir=cand["worktree"])
     revision = (brief + "\n\n" + feedback
                 + "\nKeep the change minimal and narrow, and make sure the failing-first "
                 "test still proves the fix without breaking other tests.")
     res = ra.dispatch(revision, workdir=wt, config=cfg)
-    changed = _stage_changes(wt)
-    cand["revised"] = True
     cand["revise_runtime"] = res.runtime
+    changed = _stage_changes(wt)
     if not changed:
-        # Worker couldn't address the feedback — the code is identical, so a
-        # re-verify would burn a VM/review for the same result. Stop here.
         cand["revise_noop"] = True
-        return cand
+        return False
     sh(["git", "-C", wt, "commit", "-q", "-m", f"Address review feedback: #{cand['issue']}"])
     cand["changed"] = sorted(set(cand.get("changed", []) + changed))
+    cand["patch"] = _capture_patch(wt, base_branch)
     stage_sandbox(cand, test_cmd)
     stage_review(cand, repo, base_branch)
+    return True
+
+
+def _revise_feedback(cand: dict, repo: str, interpret: bool) -> str | None:
+    """Build the revision feedback for the candidate's CURRENT failing reason
+    (a sandbox regression or a reviewer rejection). Returns None when there is
+    nothing to fix (green + approved). When `interpret`, an Opus reading of the
+    failure is prepended — critic-interpreted feedback beats raw stderr."""
+    if cand.get("sandbox") != "pass":
+        raw = cand.get("sandbox_fail") or ""
+        base = ("Your change broke existing tests in the sandbox. Fix the regression — "
+                "make the fix narrower so it doesn't break unrelated tests:\n" + raw)
+        if interpret:
+            note = rv.interpret_failure(raw, cand.get("title", ""),
+                                        repo_workdir=cand["worktree"])
+            if note:
+                base = "Root-cause analysis of the failure:\n" + note + "\n\n" + base
+        return base
+    rvobj = cand.get("_review_obj")
+    if rvobj is not None and rvobj.verdict != "approve" and rvobj.blockers:
+        return ("An independent reviewer REJECTED your fix. Address ALL these blockers:\n"
+                + "\n".join(f"- {b}" for b in rvobj.blockers))
+    return None  # green + approved (or rejected with no actionable blockers)
+
+
+def revise_loop(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg,
+                max_iters: int = 1, interpret: bool = True) -> dict:
+    """Bounded execution-feedback loop (research #8): iterate fix→sandbox→review
+    up to `max_iters` times, each round feeding the worker critic-interpreted
+    feedback, until the candidate is green + approved or we stop making progress.
+    max_iters=1 reproduces Pincer's original single-shot revise behavior."""
+    cand["revised"] = True
+    cand["revise_iters"] = 0
+    for i in range(max_iters):
+        feedback = _revise_feedback(cand, repo, interpret)
+        if feedback is None:
+            break  # nothing left to fix
+        progressed = _revise_once(cand, repo, base_branch, test_cmd, cfg, feedback)
+        cand["revise_iters"] = i + 1
+        if not progressed:
+            break
+        rvobj = cand.get("_review_obj")
+        if cand.get("sandbox") == "pass" and rvobj is not None and rvobj.verdict == "approve":
+            break  # fully resolved
     return cand
 
 
@@ -364,7 +401,7 @@ def stage_gate(cand: dict, repo: str, main_workdir: Path, allow_merge: bool, bas
     d = pg.decide(gi)
     cand["gate"] = {"action": d.action, "reasons": d.reasons, "danger": d.danger_surface}
 
-    branch = f"fix/issue-{cand['issue']}"
+    branch = cand.get("branch") or f"fix/issue-{cand['issue']}"
     if d.action == "auto_merge" and allow_merge:
         with PUBLISH_LOCK:  # serialize merges to shared default branch
             sh(["git", "-C", str(main_workdir), "checkout", base_branch])
@@ -391,7 +428,134 @@ def stage_gate(cand: dict, repo: str, main_workdir: Path, allow_merge: bool, bas
     return cand
 
 
-def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge: bool):
+@dataclasses.dataclass(frozen=True)
+class SelectionTuning:
+    """Pre-bench knobs. Defaults reproduce Pincer's original cheap loop exactly
+    (one candidate per issue, single-shot revise, no reproduction tests)."""
+    samples: int = 1              # candidate coders fanned out PER ISSUE
+    max_revise_iters: int = 1     # bounded execution-feedback loop depth
+    repro_tests: bool = False     # generate + F->P-filter reproduction tests
+    interpret_failures: bool = True
+    repro_model: str = "claude-opus-4-8"
+
+    @classmethod
+    def load(cls, path=None):
+        import os
+        cfg_path = path or os.environ.get("PINCER_CONFIG",
+                                          str(Path.home() / ".openclaw" / "pincer.toml"))
+        p = Path(cfg_path)
+        if not p.exists():
+            return cls()
+        try:
+            import tomllib
+        except ImportError:
+            try:
+                import tomli as tomllib  # type: ignore
+            except ImportError:
+                return cls()
+        try:
+            data = tomllib.loads(p.read_text())
+        except Exception:
+            return cls()
+        s = data.get("selection", {})
+        return cls(
+            samples=int(s.get("samples", 1)),
+            max_revise_iters=int(s.get("max_revise_iters", 1)),
+            repro_tests=bool(s.get("repro_tests", False)),
+            interpret_failures=bool(s.get("interpret_failures", True)),
+            repro_model=str(s.get("repro_model", "claude-opus-4-8")),
+        )
+
+
+def cand_id(c: dict) -> str:
+    """Unique state key for a candidate (issue + sample), so multiple candidates
+    per issue don't collide in the state map."""
+    s = c.get("sample", 0)
+    return str(c["issue"]) if not s else f"{c['issue']}-s{s}"
+
+
+def _cascade_reviewer(repo: str, base_branch: str):
+    """Adapter: the selection cascade's tie-breaker. Runs the real Opus review
+    (populating _review_obj for reuse downstream) and returns approve? — called
+    at most once per finalist, only when execution signals leave a tie."""
+    def _r(cand: dict) -> bool:
+        if not cand.get("_review_obj"):
+            stage_review(cand, repo, base_branch)
+        rvobj = cand.get("_review_obj")
+        return bool(rvobj is not None and rvobj.verdict == "approve")
+    return _r
+
+
+def stage_repro(issue: int, issue_cands: list[dict], repo: str, main_workdir: Path,
+                base: Path, base_branch: str, tuning: SelectionTuning) -> bool:
+    """Reproduction-test stage (research #1): generate one F->P test for the
+    issue, VALIDATE it actually fails on the unpatched base, then mark which
+    green candidates flip it. Sets cand['repro_flip']; returns whether a valid
+    repro test exists (has_repro). Best-effort: any failure returns False so the
+    cascade falls back to regression-only ranking. Heavy (VM per candidate),
+    serialized under SANDBOX_LOCK — off by default."""
+    import sandbox_gate as sg
+    green = [c for c in issue_cands if c.get("sandbox") == "pass"]
+    if len(green) < 2:
+        return False  # nothing to disambiguate
+    try:
+        title, body = _issue_text(repo, issue)
+        hint = lz.localize(str(main_workdir), f"{title} {body}").hint_block()
+        repro = rp.generate(f"{title}\n\n{body}", str(main_workdir),
+                            hint_block=hint, model=tuning.repro_model)
+        if repro is None:
+            return False
+        sgcfg = sg.SandboxConfig.from_pincer_toml()
+        test_one = f"python3 -m pytest -q {repro.path}"
+
+        # Validate on a clean base checkout: the test must FAIL on buggy code.
+        base_wt, _ = make_worktree(main_workdir, base, f"repro-{issue}", base_branch)
+        (Path(base_wt) / repro.path).write_text(repro.source)
+        with SANDBOX_LOCK:
+            base_v = sg.gate(workdir=base_wt, test_command=test_one, config=sgcfg)
+        base_res = base_v.results
+        if base_res is None or not rp.is_valid_repro(base_res):
+            sh(["git", "-C", str(main_workdir), "worktree", "remove", "--force", str(base_wt)])
+            return False  # didn't reproduce -> untrusted, discard
+
+        # Mark each green candidate that flips it (red base -> green candidate).
+        for c in green:
+            wt = c["worktree"]
+            repro_file = Path(wt) / repro.path
+            repro_file.write_text(repro.source)
+            try:
+                with SANDBOX_LOCK:
+                    cv = sg.gate(workdir=wt, test_command=test_one, config=sgcfg)
+                c["repro_flip"] = bool(cv.results is not None and rp.flips(base_res, cv.results))
+            finally:
+                repro_file.unlink(missing_ok=True)  # never pollute the candidate diff
+        sh(["git", "-C", str(main_workdir), "worktree", "remove", "--force", str(base_wt)])
+        return True
+    except Exception as e:
+        alert(f"  ⚠️ repro stage error on #{issue}: {e}")
+        return False
+
+
+def finalize_chosen(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg,
+                    tuning: SelectionTuning) -> dict:
+    """Drive one selected candidate to a terminal state: ensure it has a review
+    verdict, then run the bounded revise loop against whatever's still failing
+    (a regression or a reviewer rejection). max_revise_iters=1 == original
+    single-shot behavior."""
+    if cand.get("sandbox") == "pass" and not cand.get("_review_obj"):
+        stage_review(cand, repo, base_branch)
+    if _revise_feedback(cand, repo, interpret=False) is not None and not cand.get("revised"):
+        revise_loop(cand, repo, base_branch, test_cmd, cfg,
+                    max_iters=tuning.max_revise_iters,
+                    interpret=tuning.interpret_failures)
+    if cand.get("sandbox") == "pass" and not cand.get("_review_obj"):
+        stage_review(cand, repo, base_branch)
+    return cand
+
+
+def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge: bool,
+        tuning: "SelectionTuning | None" = None):
+    tuning = tuning or SelectionTuning.load()
     main_workdir = Path(workdir).resolve()
     base = main_workdir.parent / "pincer-worktrees"
     base.mkdir(exist_ok=True)
@@ -403,9 +567,11 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     cfg = dataclasses.replace(ra.RuntimeConfig.from_pincer_toml(), ultrawork=False)
     test_cmd = repo_test_cmd(main_workdir)
     base_branch = default_branch(main_workdir)
+    samples = max(1, tuning.samples)
     global _THREAD
     _THREAD = AlertThread(f"🔧 {repo.split('/')[-1]}") if AlertThread else None
-    state = {"repo": repo, "issues": issues, "base_branch": base_branch, "candidates": {}}
+    state = {"repo": repo, "issues": issues, "base_branch": base_branch,
+             "tuning": dataclasses.asdict(tuning), "candidates": {}, "selection": {}}
     state_path = Path("/tmp/parallel-orchestrator-state.json")
 
     def save():
@@ -417,109 +583,104 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
         save()
         return state
 
-    alert(f"🧵 Parallel loop START — {repo} issues {issues}, up to {max_coders} coders in parallel "
-          f"(base branch: {base_branch}). Crabbox serialized; reviews parallel.")
+    mode = (f"{samples}× candidates/issue, cascade-select"
+            if samples > 1 else "1 candidate/issue")
+    alert(f"🧵 Parallel loop START — {repo} issues {issues}, up to {max_coders} coders "
+          f"in parallel ({mode}; revise≤{tuning.max_revise_iters}; "
+          f"repro={'on' if tuning.repro_tests else 'off'}; base: {base_branch}).")
 
-    # Stage 1: code — parallel (per-coder progress so a long stage isn't silent)
+    # Stage 1: code — parallel over (issue × sample). Each candidate gets its own
+    # worktree; multiple samples per issue feed the selection cascade.
+    jobs = [(n, s) for n in issues for s in range(samples)]
     cands = []
     with cf.ThreadPoolExecutor(max_workers=max_coders) as ex:
-        futs = {ex.submit(stage_code, repo, main_workdir, base, n, cfg, base_branch): n for n in issues}
+        futs = {ex.submit(stage_code, repo, main_workdir, base, n, cfg, base_branch, s, samples): (n, s)
+                for (n, s) in jobs}
         for i, fut in enumerate(cf.as_completed(futs), 1):
-            n = futs[fut]
+            n, s = futs[fut]
             try:
                 c = fut.result()
             except Exception as e:
-                c = {"issue": n, "worker_status": "error", "error": str(e), "committed": False}
+                c = {"issue": n, "sample": s, "worker_status": "error",
+                     "error": str(e), "committed": False}
             cands.append(c)
-            state["candidates"][str(n)] = c
+            state["candidates"][cand_id(c)] = c
             save()
             mark = "✓" if c.get("committed") else "∅"
-            alert(f"  {mark} coded #{n} [{i}/{len(issues)}] — {c.get('worker_status','?')} "
-                  f"({c.get('runtime','?')}), {len(c.get('changed', []))} file(s)")
+            alert(f"  {mark} coded #{n}{'·s%d' % s if samples > 1 else ''} [{i}/{len(jobs)}] — "
+                  f"{c.get('worker_status','?')} ({c.get('runtime','?')}), "
+                  f"{len(c.get('changed', []))} file(s)")
     done = [c for c in cands if c.get("committed")]
-    alert(f"⌨️ Stage 1 CODE done — {len(done)}/{len(issues)} produced changes "
-          f"({', '.join('#%s:%s' % (c['issue'], c.get('runtime','?')) for c in cands)}).")
+    alert(f"⌨️ Stage 1 CODE done — {len(done)}/{len(jobs)} candidate(s) produced changes.")
 
-    # Stage 2: sandbox — SERIAL
+    # Stage 2: sandbox — SERIAL, structured results for regression-aware ranking.
     for c in done:
         stage_sandbox(c, test_cmd)
-        state["candidates"][str(c["issue"])] = c
+        state["candidates"][cand_id(c)] = c
         save()
-    alert(f"📦 Stage 2 SANDBOX done — {sum(1 for c in done if c.get('sandbox')=='pass')}/{len(done)} green "
-          f"({', '.join('#%s:%s' % (c['issue'], c.get('sandbox')) for c in done)}).")
+    alert(f"📦 Stage 2 SANDBOX done — {sum(1 for c in done if c.get('sandbox')=='pass')}/{len(done)} green.")
 
-    # Stage 2.5: retry REGRESSIONS once (tests ran and failed -> fixable). Infra
-    # 'error' verdicts are skipped — a code edit can't fix a VM/dep problem.
-    sb_retry = [c for c in done if _retryable_sandbox(c.get("sandbox")) and not c.get("revised")]
-    if sb_retry:
-        alert(f"♻️ Revising {len(sb_retry)} fix(es) that broke tests: "
-              + ", ".join(f"#{c['issue']}" for c in sb_retry))
-        for c in sb_retry:
-            fb = ("Your change broke existing tests in the sandbox. Fix the regression — "
-                  "make the fix narrower so it doesn't break unrelated tests:\n" + (c.get("sandbox_fail") or ""))
-            stage_revise(c, repo, base_branch, test_cmd, cfg, fb)
-            state["candidates"][str(c["issue"])] = c
-            save()
-            rev = c["review"]["verdict"] if isinstance(c.get("review"), dict) else "-"
-            alert(f"  ♻️ revised #{c['issue']} → sandbox={c.get('sandbox')}, review={rev}"
-                  + (" (no-op: worker couldn't address it)" if c.get("revise_noop") else ""))
-    passed = [c for c in done if c.get("sandbox") == "pass"]
+    by_issue: dict[int, list] = {}
+    for c in done:
+        by_issue.setdefault(c["issue"], []).append(c)
 
-    # Stage 3: review — parallel (skip ones already reviewed during a revise)
-    need_review = [c for c in passed if not c.get("_review_obj")]
-    if need_review:
-        alert(f"🔎 Reviewing {len(need_review)} candidate(s) (Opus reads the repo — "
-              f"a few min each): {', '.join('#%s' % c['issue'] for c in need_review)}")
-    with cf.ThreadPoolExecutor(max_workers=max_coders) as ex:
-        list(ex.map(lambda c: stage_review(c, repo, base_branch), need_review))
-    for c in passed:
-        state["candidates"][str(c["issue"])] = c
-    save()
-    alert("🔎 Stage 3 REVIEW done — " +
-          ", ".join("#%s:%s" % (c["issue"], c["review"]["verdict"]) for c in passed))
+    # Stage 2.5: reproduction tests (optional) — generate one F->P test per
+    # issue and mark candidates that flip it. Gated; heavy; off by default.
+    has_repro: dict[int, bool] = {}
+    if tuning.repro_tests:
+        alert("🧪 Reproduction-test stage — generating F→P tests + flip-checking candidates.")
+        for n, issue_cands in by_issue.items():
+            has_repro[n] = stage_repro(n, issue_cands, repo, main_workdir, base, base_branch, tuning)
+            if has_repro[n]:
+                flips = [c["issue"] for c in issue_cands if c.get("repro_flip")]
+                alert(f"  🧪 #{n}: valid repro test — {len(flips)} candidate(s) flip it.")
 
-    # Stage 3.5: revise reviewer-rejected fixes once with the blockers.
-    to_retry = [c for c in passed
-                if c.get("_review_obj") and c["_review_obj"].verdict != "approve"
-                and c["_review_obj"].blockers and not c.get("revised")]
-    if to_retry:
-        alert(f"♻️ Revising {len(to_retry)} rejected fix(es) with reviewer blockers: "
-              + ", ".join(f"#{c['issue']}" for c in to_retry))
-        for c in to_retry:
-            fb = ("An independent reviewer REJECTED your fix. Address ALL these blockers:\n"
-                  + "\n".join(f"- {b}" for b in c["_review_obj"].blockers))
-            stage_revise(c, repo, base_branch, test_cmd, cfg, fb)
-            state["candidates"][str(c["issue"])] = c
-            save()
-            alert(f"  ♻️ revised #{c['issue']} → review={c['_review_obj'].verdict}"
-                  + (" (no-op)" if c.get("revise_noop") else ""))
-        flipped = sum(1 for c in to_retry if c["_review_obj"].verdict == "approve")
-        alert(f"♻️ Revision done — {flipped}/{len(to_retry)} now approved "
-              + ", ".join("#%s:%s" % (c["issue"], c["_review_obj"].verdict) for c in to_retry))
-        passed = [c for c in done if c.get("sandbox") == "pass"]  # some may have flipped
+    # Stage 2.6: SELECT — cascade one winner per issue (regression → reproduction
+    # → AST-vote → reviewer). For samples==1 this is a no-op pass-through.
+    reviewer = _cascade_reviewer(repo, base_branch)
+    chosen = []
+    for n, issue_cands in by_issue.items():
+        result = sel.select(issue_cands, reviewer=reviewer, has_repro=has_repro.get(n, False))
+        state["selection"][str(n)] = result.to_dict()
+        if result.chosen is not None:
+            result.chosen["selected"] = True
+            result.chosen["selection_stage"] = result.stage
+            chosen.append(result.chosen)
+        if samples > 1:
+            alert(f"  🎯 #{n}: chose {cand_id(result.chosen) if result.chosen else 'none'} "
+                  f"via {result.stage} (from {result.diagnostics.get('n_eligible', 0)} eligible).")
+        save()
 
-    # Stage 4: gate + publish (serial publish via lock)
-    for c in passed:
+    # Stage 2.7 + 3: finalize each chosen candidate — review + bounded revise loop.
+    alert(f"🔎 Finalizing {len(chosen)} selected candidate(s) (review + revise≤{tuning.max_revise_iters}).")
+    for c in chosen:
+        finalize_chosen(c, repo, base_branch, test_cmd, cfg, tuning)
+        state["candidates"][cand_id(c)] = c
+        save()
+        rev = c["_review_obj"].verdict if c.get("_review_obj") else "-"
+        alert(f"  ✅ #{c['issue']} → sandbox={c.get('sandbox')}, review={rev}, "
+              f"revise_iters={c.get('revise_iters', 0)}")
+
+    # Stage 4: gate + publish (serial publish via lock) — only chosen+green.
+    publishable = [c for c in chosen if c.get("sandbox") == "pass"]
+    for c in publishable:
         stage_gate(c, repo, main_workdir, allow_merge, base_branch)
-        state["candidates"][str(c["issue"])] = c
+        state["candidates"][cand_id(c)] = c
         save()
 
-    merged = [c for c in passed if c.get("published") == "auto_merged"]
-    prd = [c for c in passed if str(c.get("published", "")).startswith("pr")]
-    # Surface everything else so nothing silently vanishes: a candidate that
-    # never passed the sandbox (regression we couldn't fix, or infra error), or
-    # a worker that produced no changes.
-    failed = [c for c in done if c.get("sandbox") not in ("pass", None)]
-    no_change = [c for c in cands if not c.get("committed")]
+    merged = [c for c in publishable if c.get("published") == "auto_merged"]
+    prd = [c for c in publishable if str(c.get("published", "")).startswith("pr")]
+    failed = [c for c in chosen if c.get("sandbox") not in ("pass", None)]
+    no_winner = [n for n in issues if n not in {c["issue"] for c in chosen}]
     state["result"] = "done"
     state["scorecard"] = {"merged": [c["issue"] for c in merged],
                           "prd": [c["issue"] for c in prd],
                           "failed_verification": [c["issue"] for c in failed],
-                          "no_changes": [c.get("issue") for c in no_change]}
+                          "no_winner": no_winner}
     alert(f"🏁 Parallel loop DONE — {len(merged)} merged, {len(prd)} PR'd, "
-          f"{len(failed)} failed verification, {len(no_change)} no-change. "
+          f"{len(failed)} failed verification, {len(no_winner)} with no winning candidate. "
           + " | ".join("#%s:%s" % (c["issue"], c.get("published") or c.get("sandbox", "?"))
-                       for c in done))
+                       for c in chosen))
     save()
     return state
 
@@ -531,9 +692,28 @@ def main():
     ap.add_argument("--issues", required=True, help="comma-separated issue numbers")
     ap.add_argument("--max-coders", type=int, default=6)
     ap.add_argument("--no-merge", action="store_true", help="PR everything, never auto-merge")
+    # Pre-bench selection knobs. Omitted -> values from [selection] in pincer.toml
+    # (which themselves default to the original 1-candidate behavior).
+    ap.add_argument("--samples", type=int, default=None,
+                    help="candidate coders fanned out PER ISSUE (selection cascade picks one)")
+    ap.add_argument("--max-revise-iters", type=int, default=None,
+                    help="bounded execution-feedback loop depth (default 1)")
+    ap.add_argument("--repro-tests", dest="repro_tests", action="store_true", default=None,
+                    help="generate + F->P-filter reproduction tests (heavy)")
+    ap.add_argument("--no-repro-tests", dest="repro_tests", action="store_false",
+                    help="disable reproduction tests")
     a = ap.parse_args()
     issues = [int(x) for x in a.issues.split(",") if x.strip()]
-    run(a.repo, a.workdir, issues, a.max_coders, allow_merge=not a.no_merge)
+
+    base_tuning = SelectionTuning.load()
+    tuning = dataclasses.replace(
+        base_tuning,
+        samples=a.samples if a.samples is not None else base_tuning.samples,
+        max_revise_iters=(a.max_revise_iters if a.max_revise_iters is not None
+                          else base_tuning.max_revise_iters),
+        repro_tests=(a.repro_tests if a.repro_tests is not None else base_tuning.repro_tests),
+    )
+    run(a.repo, a.workdir, issues, a.max_coders, allow_merge=not a.no_merge, tuning=tuning)
 
 
 if __name__ == "__main__":
