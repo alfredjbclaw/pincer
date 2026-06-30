@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — loop health: run ledger, auto-pause, preflight, cascade validation
+
+Staged on `feat/buildouts`; not yet merged.
+
+### New
+
+- **Run ledger + auto-pause** (`tools/run_ledger.py`). Every loop run's outcome is
+  appended to `~/.openclaw/pincer/run-ledger.jsonl`. The driver classifies each
+  run (shipped / infra-failure / held / no-fix) and **auto-pauses a loop after 3
+  consecutive infrastructure failures** (broken env, like the corrupted-clone
+  case) with a critical alert — so it stops burning credits and pings a human,
+  instead of failing silently every few hours. A "no fix found" run proves the
+  engine works and resets the streak; a budget-held run is neutral.
+- **Preflight** (`tools/preflight.py`). Before dispatching coders, verify the
+  basics (git, GitHub auth, crabbox). A blocker (e.g. unauthenticated `gh`) halts
+  the run with one clear reason; warnings (e.g. crabbox missing) surface but don't
+  stop it. Wired into `loop_spec.run_spec`.
+- **Cascade validation harness** (`tools/validate_cascade.py`). `--offline`
+  (default) drives the selection cascade through realistic multi-stage scenarios
+  and asserts each is resolved by the expected stage (regression → reproduction →
+  majority-vote → reviewer → single). `--live` runs the real pipeline with
+  `--samples N` and reports the per-issue selection stage — guarded to refuse if a
+  pincer/crabbox run is already in flight (never contends).
+
 ## 0.2.1 — 2026-06-29
 
 Quieter, smarter run alerts.

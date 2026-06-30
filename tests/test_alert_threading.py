@@ -66,6 +66,7 @@ def test_run_spec_starts_own_thread_when_standalone(monkeypatch):
 class FakeSpec:
     def __init__(self, name):
         self.name = name
+        self.repo = f"owner/{name}"
         self.enabled = True
         self.schedule = "6h"
         self.last_run = None
@@ -87,6 +88,10 @@ def test_loop_driver_threads_all_loops_under_one_root(monkeypatch):
     monkeypatch.setattr(ld.LoopSpec, "all", staticmethod(lambda: specs))
     monkeypatch.setattr(ld, "is_due", lambda s, now: True)
     monkeypatch.setattr(sys, "argv", ["loop_driver"])
+    # Isolate the run-ledger/auto-pause hook from this threading test.
+    monkeypatch.setattr(ld.run_ledger, "record", lambda *a, **k: None)
+    monkeypatch.setattr(ld.run_ledger, "read", lambda *a, **k: [])
+    monkeypatch.setattr(ld.run_ledger, "should_pause", lambda *a, **k: False)
 
     ld.main()
 

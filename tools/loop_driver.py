@@ -17,6 +17,7 @@ from pathlib import Path
 THIS = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS))
 import parallel_orchestrator as po
+import run_ledger
 from loop_spec import LoopSpec, run_spec
 from notify import send_alert
 
@@ -109,6 +110,18 @@ def main():
                 post(f"💥 Loop '{spec.name}' crashed: {e}", "critical")
             spec.last_run = now.isoformat()
             spec.save()
+            # Record the outcome, then auto-pause a loop that keeps failing for
+            # infrastructure reasons (broken env) — stop burning credits + page.
+            run_ledger.record(spec.name, spec.repo, r.get("result", "?"),
+                              r.get("scorecard", {}), now.isoformat())
+            rows = run_ledger.read(spec.name)
+            if spec.enabled and run_ledger.should_pause(rows):
+                spec.enabled = False
+                spec.save()
+                streak = run_ledger.consecutive_infra_failures(rows)
+                post(f"⏸️🚨 Auto-PAUSED loop '{spec.name}' after {streak} consecutive "
+                     f"infrastructure failures (broken env, not 'no fix found'). "
+                     f"Re-enable once fixed.", "critical")
             results.append(r)
         merged = sum(len(r.get("scorecard", {}).get("merged", []) or []) for r in results)
         post(f"⏰ Loop driver tick done — {len(results)} loop(s) run, {merged} change(s) merged. "

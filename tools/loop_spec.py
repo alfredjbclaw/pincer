@@ -30,6 +30,7 @@ THIS = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS))
 import parallel_orchestrator as po
 import audit as audit_mod
+import preflight
 
 LOOPS_DIR = Path.home() / ".openclaw" / "pincer" / "loops"
 # Optional external usage gate; set $PINCER_USAGE_GATE to its path to enable.
@@ -138,6 +139,19 @@ def run_spec(spec: LoopSpec, thread=None) -> dict:
     if not ok:
         post(f"⏸️ Loop '{spec.name}' held — {why}", "milestone")
         return {"name": spec.name, "result": "held_budget", "detail": why}
+
+    # Preflight: verify the basics (git, gh auth, crabbox) before spending a
+    # dispatch. A blocker halts the run with one clear reason; warnings surface
+    # but don't stop it.
+    problems = preflight.preflight()
+    if problems:
+        post(f"⚠️ Loop '{spec.name}' preflight: {preflight.summary(problems)}",
+             "milestone")
+    if preflight.has_blockers(problems):
+        post(f"🚨 Loop '{spec.name}' BLOCKED by preflight — not dispatching.", "critical")
+        return {"name": spec.name, "result": "preflight_blocked",
+                "problems": [p.message for p in problems]}
+
     # The orchestrator emits its own START milestone; keep this one as detail so
     # quiet mode isn't redundant.
     post(f"🔁 Loop '{spec.name}' START — {spec.mode} on {spec.repo} ({why}).")
