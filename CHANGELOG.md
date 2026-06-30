@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.1 — 2026-06-29
+
+Quieter, smarter run alerts.
+
+### Changed
+
+- **Edit-in-place status board (default).** A run now posts ONE status message
+  that edits itself in place as it progresses, sent silently — so a normal run
+  never buzzes the phone. A `critical` event (🚨 INFRA FAILURE / crash) still
+  sends one discrete notification. Set `[alerts].style = "thread"` for the old
+  reply-chain of separate messages. New `notify.LiveBoard` (drop-in for
+  `AlertThread`); backend gains additive `edit_message` + `silent=`.
+- **Local run logs.** The full blow-by-blow (every stage + candidate, including
+  lines the quiet board hides) is written to
+  `~/.openclaw/pincer/run-logs/<ts>-<repo>.md`, one per run, auto-pruned to the
+  last 50 — a debug feed independent of Telegram.
+
 ## 0.2.0 — 2026-06-29
 
 Standalone portability, live-run reliability, a pre-bench selection cascade, and SWE-bench harness plumbing.
