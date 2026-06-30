@@ -60,7 +60,8 @@ def main():
 
     # Single-runner lock: a tick can run long pipelines; never let the next
     # cron tick overlap it.
-    lock = Path("/tmp/pincer-loop-driver.lock")
+    import os
+    lock = Path(os.environ.get("PINCER_LOOP_LOCK", "/tmp/pincer-loop-driver.lock"))
     if not a.dry_run and lock.exists():
         try:
             pid = int(lock.read_text().strip())

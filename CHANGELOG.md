@@ -1,10 +1,23 @@
 # Changelog
 
-## Unreleased — loop health: run ledger, auto-pause, preflight, cascade validation
+## Unreleased — loop health + memory-aware sandbox concurrency
 
 Staged on `feat/buildouts`; not yet merged.
 
 ### New
+
+- **Memory-aware sandbox concurrency** (`tools/mem_monitor.py` + orchestrator
+  `sandbox_slot`). The hard single-VM lock becomes a memory-aware gate: pincer
+  runs up to `[sandbox].max_concurrent` Crabbox VMs in parallel, but starts
+  another only while host free RAM can absorb it above a floor (`min_free_gb`) —
+  so it uses the box's capacity when idle and backs off when memory is tight,
+  even across multiple pincer processes (the check reads host RAM, not a
+  per-process counter). RAM is sampled around each VM to
+  `~/.openclaw/pincer/mem-samples.jsonl` for usage/leak tracking
+  (`detect_leak`). New `[sandbox]` knobs: `max_concurrent` (default raised to 2),
+  `min_free_gb`, `vm_memory_gb`, `vm_gate_max_wait_s`. Complements the existing
+  host `memory-watchdog` cron (alerting safety net). At `max_concurrent=1` the
+  behavior is identical to the old single lock.
 
 - **Run ledger + auto-pause** (`tools/run_ledger.py`). Every loop run's outcome is
   appended to `~/.openclaw/pincer/run-ledger.jsonl`. The driver classifies each

@@ -50,11 +50,27 @@ gate = "every"
 # Default test command. Each repo can override via .pincer.toml at its root.
 default_test = "make test"
 
-# Maximum concurrent Crabbox VMs at any one time. Each Apple VZ VM
-# pre-allocates 8 GiB of host memory by default. Stacking VMs is the fastest
-# way to burn through RAM on a workstation. Default: 1 (strict serialization).
-# Raise only if the host has enough memory to absorb N × 8 GiB without paging.
-max_concurrent = 1
+# Maximum concurrent Crabbox VMs (per pincer process). Each Apple VZ VM
+# pre-allocates ~8 GiB. This is now MEMORY-AWARE: pincer will run up to this many
+# VMs in parallel, but only starts another while host free RAM can absorb it
+# (see min_free_gb) — so it uses the box's capacity when idle and backs off when
+# memory is tight, even across multiple pincer processes. Default: 2 (safe on a
+# 48 GiB box: 2×8 = 16 GiB). Raise to 3 if you want more parallelism and watch
+# the run-log / mem-samples.
+max_concurrent = 2
+
+# Free-RAM floor (GiB). A new VM is only started if doing so leaves at least this
+# much free RAM for the OS + gateway + other services + a spike. The real safety
+# valve behind max_concurrent. Default: 12.
+min_free_gb = 12
+
+# Expected RAM each VM reserves (GiB) — used by the gate's headroom math. Match
+# your crabbox VM memory size. Default: 8 (Apple VZ default).
+vm_memory_gb = 8
+
+# How long (seconds) to wait for RAM to free up before starting a VM anyway
+# (logged). Prevents a wedged run if memory never recovers. Default: 600.
+vm_gate_max_wait_s = 600
 
 # Per-lease idle timeout. Crabbox releases stale leases automatically; this is
 # the safety net in case the orchestrator crashes mid-run. Match to your

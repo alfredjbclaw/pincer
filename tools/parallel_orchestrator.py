@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """pincer parallel orchestrator — fan-out coders, serialize the sandbox.
 
-The Crabbox VM (8 GiB each, max_concurrent=1) is only needed at final
-verification, NOT during coding. So we parallelize the expensive-but-cheap-on-
-memory coding stage and serialize ONLY the sandbox:
+The Crabbox VM (~8 GiB each) is only needed at final verification, NOT during
+coding. So we parallelize the cheap-on-memory coding stage and gate the sandbox
+by a MEMORY-AWARE limit (up to [sandbox].max_concurrent VMs, started only while
+host RAM can absorb another — see sandbox_slot / mem_monitor):
 
     N issues
       → [coders in parallel, each in its own git worktree]   (bounded by usage gate)
-      → [Crabbox sandbox, ONE at a time]                     (the only serial stage)
+      → [Crabbox sandbox, ≤max_concurrent VMs, RAM-gated]    (memory-aware)
       → [Opus-4.8 review, in parallel]                       (no VM)
       → [publication gate → auto-merge | PR, per candidate]
 
@@ -125,10 +126,77 @@ def _run_log(msg: str, level: str) -> None:
     except Exception:
         pass
 
-# The Crabbox stage is the only hard-serial section (host memory ceiling).
-SANDBOX_LOCK = threading.Lock()
 PUBLISH_LOCK = threading.Lock()   # git merge to the shared main must serialize
 WORKTREE_LOCK = threading.Lock()  # `git worktree add` touches shared .git; serialize setup only
+
+# --- Memory-aware sandbox concurrency ---------------------------------------
+# Each Apple VZ VM pre-allocates ~8 GiB. Instead of a hard single-VM lock, allow
+# up to `max_concurrent` VMs but only start one while host RAM can absorb it
+# (back-pressure across processes via mem_monitor). Defaults stay conservative;
+# tune via [sandbox] in pincer.toml.
+import contextlib  # noqa: E402
+import mem_monitor as mm  # noqa: E402
+
+_SANDBOX_SEM = threading.BoundedSemaphore(1)
+_SANDBOX_GATE = {"max_concurrent": 1, "min_free_gb": 12.0, "vm_memory_gb": 8.0,
+                 "max_wait_s": 600}
+
+
+def _sandbox_gate_config():
+    """[sandbox] concurrency knobs. Read here (not via sandbox_gate) so this file
+    stays independent. Defaults are safe on a 48 GiB box."""
+    cfg = dict(_SANDBOX_GATE)
+    try:
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore
+        p = Path(os.environ.get("PINCER_CONFIG", Path.home() / ".openclaw" / "pincer.toml"))
+        if p.exists():
+            s = tomllib.loads(p.read_text()).get("sandbox", {})
+            cfg["max_concurrent"] = int(s.get("max_concurrent", cfg["max_concurrent"]))
+            cfg["min_free_gb"] = float(s.get("min_free_gb", cfg["min_free_gb"]))
+            cfg["vm_memory_gb"] = float(s.get("vm_memory_gb", cfg["vm_memory_gb"]))
+            cfg["max_wait_s"] = int(s.get("vm_gate_max_wait_s", cfg["max_wait_s"]))
+    except Exception:
+        pass
+    return cfg
+
+
+def _init_sandbox_gate():
+    global _SANDBOX_SEM, _SANDBOX_GATE
+    _SANDBOX_GATE = _sandbox_gate_config()
+    _SANDBOX_SEM = threading.BoundedSemaphore(max(1, _SANDBOX_GATE["max_concurrent"]))
+
+
+def _now_stamp():
+    import datetime
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+@contextlib.contextmanager
+def sandbox_slot():
+    """Acquire a sandbox VM slot: the per-process semaphore cap AND enough host
+    RAM (waits with back-off, then proceeds cautiously after `max_wait_s`).
+    Samples RAM around the VM for leak tracking. Replaces the old single lock —
+    with max_concurrent=1 it behaves exactly like before."""
+    c = _SANDBOX_GATE
+    _SANDBOX_SEM.acquire()
+    try:
+        deadline = time.monotonic() + c["max_wait_s"]
+        while True:
+            ok, why = mm.can_start_vm(c["min_free_gb"], c["vm_memory_gb"])
+            if ok:
+                break
+            if time.monotonic() >= deadline:
+                alert(f"⚠️ sandbox RAM gate: proceeding after wait — {why}", "milestone")
+                break
+            time.sleep(5)
+        mm.log_sample("vm_start", _now_stamp())
+        yield
+    finally:
+        mm.log_sample("vm_end", _now_stamp())
+        _SANDBOX_SEM.release()
 
 
 def sh(cmd, cwd=None, timeout=1800):
@@ -375,7 +443,7 @@ def stage_sandbox(cand: dict, test_cmd: str) -> dict:
     if not cand.get("committed"):
         cand["sandbox"] = "skip_no_changes"
         return cand
-    with SANDBOX_LOCK:  # only one Crabbox VM at a time
+    with sandbox_slot():  # memory-aware: up to max_concurrent VMs, RAM-gated
         out, err, rc = sh(["python3", str(THIS / "sandbox_gate.py"), "--workdir",
                            cand["worktree"], "--test", test_cmd, "--json"], timeout=1800)
     try:
@@ -673,7 +741,7 @@ def stage_repro(issue: int, issue_cands: list[dict], repo: str, main_workdir: Pa
     green candidates flip it. Sets cand['repro_flip']; returns whether a valid
     repro test exists (has_repro). Best-effort: any failure returns False so the
     cascade falls back to regression-only ranking. Heavy (VM per candidate),
-    serialized under SANDBOX_LOCK — off by default."""
+    serialized under sandbox_slot() — off by default."""
     import sandbox_gate as sg
     green = [c for c in issue_cands if c.get("sandbox") == "pass"]
     if len(green) < 2:
@@ -704,7 +772,7 @@ def stage_repro(issue: int, issue_cands: list[dict], repo: str, main_workdir: Pa
             repro_file = Path(wt) / repro.path
             repro_file.write_text(repro.source)
             try:
-                with SANDBOX_LOCK:
+                with sandbox_slot():
                     cv = sg.gate(workdir=wt, test_command=test_one, config=sgcfg)
                 c["repro_flip"] = bool(cv.results is not None and rp.flips(base_res, cv.results))
             finally:
@@ -745,6 +813,7 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     _THREAD = thread if thread is not None else make_alert_thread(f"🔧 {repo.split('/')[-1]}")
     import datetime
     _start_run_log(repo, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    _init_sandbox_gate()  # size the memory-aware VM semaphore from [sandbox] config
 
     # Self-heal the workdir BEFORE anything reads it: re-clone if missing/broken,
     # else fetch + hard-reset. Returns a default branch guaranteed to resolve.

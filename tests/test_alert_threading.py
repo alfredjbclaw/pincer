@@ -75,7 +75,7 @@ class FakeSpec:
         pass
 
 
-def test_loop_driver_threads_all_loops_under_one_root(monkeypatch):
+def test_loop_driver_threads_all_loops_under_one_root(monkeypatch, tmp_path):
     seen_threads = []
 
     def fake_run_spec(spec, thread=None):
@@ -88,6 +88,8 @@ def test_loop_driver_threads_all_loops_under_one_root(monkeypatch):
     monkeypatch.setattr(ld.LoopSpec, "all", staticmethod(lambda: specs))
     monkeypatch.setattr(ld, "is_due", lambda s, now: True)
     monkeypatch.setattr(sys, "argv", ["loop_driver"])
+    # Isolate from the real single-runner lock (a live driver may hold it).
+    monkeypatch.setenv("PINCER_LOOP_LOCK", str(tmp_path / "test-driver.lock"))
     # Isolate the run-ledger/auto-pause hook from this threading test.
     monkeypatch.setattr(ld.run_ledger, "record", lambda *a, **k: None)
     monkeypatch.setattr(ld.run_ledger, "read", lambda *a, **k: [])
