@@ -1,11 +1,17 @@
 # Changelog
 
-## Unreleased — loop health + memory-aware sandbox concurrency
+## 0.2.2 — 2026-06-29
 
-Staged on `feat/buildouts`; not yet merged.
+Multi-language sandbox provisioning, loop health, and memory-aware concurrency.
 
 ### New
 
+- **Declarative multi-language toolchain provisioning** (`tools/toolchain.py`).
+  The sandbox can prepend an apt-only install prelude to the test command so the
+  Crabbox VM has the right runtime for any language (node/go/python/rust/…),
+  driven by a declarative toolchain list; `sandbox_gate.gate()` gains `toolchain`
+  and `reap_stale` params (stale-lease reaping to prevent Apple VZ VM stacking).
+  Also threaded into `fleet_build`.
 - **Memory-aware sandbox concurrency** (`tools/mem_monitor.py` + orchestrator
   `sandbox_slot`). The hard single-VM lock becomes a memory-aware gate: pincer
   runs up to `[sandbox].max_concurrent` Crabbox VMs in parallel, but starts

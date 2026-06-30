@@ -1,6 +1,6 @@
 {
   "name": "pincer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "conformance_version": "1.0.0",
   "description": "A four-tier autonomous maintainer loop for OpenClaw: Mission (audit & plan) → Goal (triage) → Control (orchestrate) → Agent (Codex/Claude Code) → Sandbox (Crabbox) → Tool. Frontier-model plans, mid-tier executes, sandboxed verification before every PR.",
   "homepage": "https://github.com/alfredjbclaw/pincer",
