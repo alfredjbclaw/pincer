@@ -37,9 +37,43 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_results as tr
+import toolchain as tc
 
 PINCER_CONFIG_DEFAULT = Path.home() / ".openclaw" / "pincer.toml"
 TAIL_BYTES = 4000
+
+
+def reap_stale_leases(provider: str) -> int:
+    """Stop any pre-existing crabbox leases for `provider` before a fresh run.
+
+    A run that is SIGTERM'd/SIGKILL'd (wrapping timeout, OOM/jetsam) is killed
+    before crabbox's graceful auto-release fires, orphaning its VM. On Apple VZ
+    each orphan holds 8 GiB; stacking a few reproduces the memory-pressure
+    jetsam that then kills the next run. Reaping stale leases up front breaks
+    that loop. Safe under the `max_concurrent=1` policy. Returns count reaped.
+    """
+    import re
+    if shutil.which("crabbox") is None:
+        return 0
+    try:
+        out = subprocess.run(
+            ["crabbox", "list", "--provider", provider],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except Exception:
+        return 0
+    reaped = 0
+    for slug in re.findall(r"slug=([A-Za-z0-9-]+)", out):
+        try:
+            subprocess.run(
+                ["crabbox", "stop", "--provider", provider,
+                 "--target", "linux", "--id", slug],
+                capture_output=True, text=True, timeout=60,
+            )
+            reaped += 1
+        except Exception:
+            pass
+    return reaped
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,12 +133,26 @@ def gate(
     workdir: Path | str,
     test_command: Optional[str] = None,
     config: Optional[SandboxConfig] = None,
+    toolchain: Optional[list] = None,
+    reap_stale: bool = False,
 ) -> SandboxVerdict:
-    """Run `crabbox run --provider <p> -- <test>` against workdir, return verdict."""
+    """Run `crabbox run --provider <p> -- <test>` against workdir, return verdict.
+
+    `toolchain`: optional list of language/tool names (or raw apt packages); an
+    apt-only install prelude is prepended to `test_command` so the VM has the
+    right runtime for ANY language (node/go/python/rust/...). See toolchain.py.
+    `reap_stale`: stop orphaned leases for the provider before running (prevents
+    Apple VZ VM stacking from killed prior runs).
+    """
     cfg = config or SandboxConfig.from_pincer_toml()
     workdir = Path(workdir).resolve()
     test_command = test_command or cfg.default_test
+    # Prepend the declarative toolchain prelude (no-op when toolchain is empty).
+    test_command = tc.apply(test_command, toolchain)
     started = time.monotonic()
+
+    if reap_stale:
+        reap_stale_leases(cfg.provider)
 
     if shutil.which("crabbox") is None:
         return SandboxVerdict(
@@ -223,6 +271,12 @@ def _cli() -> int:
     parser.add_argument("--test", default=None, help="test command (defaults to config.default_test)")
     parser.add_argument("--provider", default=None, help="crabbox provider override")
     parser.add_argument("--timeout", type=int, default=None)
+    parser.add_argument("--toolchain", default=None,
+                        help="comma/space-separated languages or apt packages to install "
+                             "in the VM before the test (e.g. 'node', 'go', 'python rust')")
+    parser.add_argument("--reap", action="store_true",
+                        help="stop orphaned leases for the provider before running "
+                             "(prevents Apple VZ VM stacking from killed prior runs)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -234,7 +288,8 @@ def _cli() -> int:
         overrides["timeout_seconds"] = args.timeout
     cfg = dataclasses.replace(cfg, **overrides)
 
-    verdict = gate(workdir=args.workdir, test_command=args.test, config=cfg)
+    verdict = gate(workdir=args.workdir, test_command=args.test, config=cfg,
+                   toolchain=tc.parse_list(args.toolchain), reap_stale=args.reap)
     if args.json:
         print(json.dumps(verdict.to_dict(), indent=2))
     else:

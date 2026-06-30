@@ -19,12 +19,17 @@ from pathlib import Path
 THIS = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS))
 import runtime_adapter as ra
+import toolchain as tc
 from notify import send_alert, AlertThread
 
 _THREAD = None
 
-# Plan-driven: pass --plan <json> to build any project; defaults to cfgcheck.
-# Plan schema: {repo_dir, state_path, test_cmd, modules: [[name, files, task], ...]}
+# Plan-driven: pass --plan <json> to build any project in any language.
+# Plan schema: {repo_dir, state_path, test_cmd, modules: [[name, files, task], ...],
+#               language?: "go"|"node"|"python"|..., toolchain?: ["node", ...]}
+# `toolchain` is installed in the VM by sandbox_gate (apt-only, contract-safe) —
+# do NOT hand-roll curl|tar/export in test_cmd (pipes/redirects don't survive the
+# crabbox argv contract). See toolchain.py.
 import argparse as _argparse
 _p = _argparse.ArgumentParser()
 _p.add_argument("--plan")
@@ -34,15 +39,16 @@ if _args.plan:
     _plan = json.loads(Path(_args.plan).read_text())
     REPO = _plan["repo_dir"]
     STATE = Path(_plan["state_path"])
-    GOTEST = _plan["test_cmd"]
+    TEST_CMD = _plan["test_cmd"]
     MODULES = [tuple(m) for m in _plan["modules"]]
+    LANG = _plan.get("language", "go")
+    TOOLCHAIN = tc.parse_list(_plan.get("toolchain"))
 else:
     REPO = "/tmp/cfgcheck"
     STATE = Path("/tmp/fleet-build-state.json")
-    GO = "go1.22.5"
-    GOTEST = (f"sudo apt-get update -qq && sudo apt-get install -y -qq curl ca-certificates && "
-              f"curl -sSL https://go.dev/dl/{GO}.linux-arm64.tar.gz | sudo tar -C /usr/local -xz && "
-              f"export PATH=$PATH:/usr/local/go/bin && go mod tidy && go test ./...")
+    LANG = "go"
+    TOOLCHAIN = ["go"]                      # apt golang-go in the VM (contract-safe)
+    TEST_CMD = "go mod tidy && go test ./..."
     MODULES = [
         ("validate-json", "pkg/validate/json.go + pkg/validate/json_test.go",
          "Implement ValidateJSON using encoding/json."),
@@ -81,33 +87,44 @@ def save(): STATE.write_text(json.dumps(state, indent=2, default=str))
 
 def build_module(mod):
     name, files, task = mod
-    brief = (f"You are building one part of a Go project. SHARED CONTRACT all parts must match:\n\n"
+    brief = (f"You are building one part of a {LANG} project. SHARED CONTRACT all parts must match:\n\n"
              f"{CONTRACT}\n\nYOUR TASK: create exactly these file(s): {files}\n{task}\n\n"
-             "Match the contract signatures EXACTLY. Use only stdlib + the deps already in go.mod. "
-             "Do NOT modify go.mod/go.sum, do NOT run `go mod tidy`, do NOT create any other files. "
-             "Write idiomatic Go with real table-driven tests covering valid AND invalid inputs.")
+             "Match the contract signatures/interfaces EXACTLY. Use only the standard library plus the "
+             "dependencies already declared in the project's manifest/lockfile. Do NOT modify dependency "
+             "manifests or lockfiles, do NOT create any other files. Write idiomatic code with real tests "
+             "covering valid AND invalid inputs.")
     res = ra.dispatch(brief, workdir=REPO, config=CFG)
     return {"name": name, "files": files, "status": res.status,
             "runtime": res.runtime, "fallback": res.fallback_used}
 
 def vm_test():
-    out, err, rc = sh(["python3", str(THIS / "sandbox_gate.py"),
-                       "--workdir", REPO, "--test", GOTEST, "--json"], 1800)
+    cmd = ["python3", str(THIS / "sandbox_gate.py"),
+           "--workdir", REPO, "--test", TEST_CMD, "--json", "--reap"]
+    if TOOLCHAIN:
+        cmd += ["--toolchain", ",".join(TOOLCHAIN)]
+    out, err, rc = sh(cmd, 1800)
     try:
         j = json.loads(out)
         tail = (j.get("stdout_tail", "") + "\n" + j.get("stderr_tail", ""))
-        keep = [l for l in tail.splitlines() if any(m in l for m in
-                ("FAIL", "ok ", "Error", "error", "cannot", "undefined", "expected",
-                 ".go:", "no test files", "PASS")) and "debconf" not in l and "crabbox" not in l]
+        # Language-agnostic failure markers (Go, Node, Python, Rust, generic).
+        markers = ("FAIL", "ok ", "Error", "error", "cannot", "undefined", "expected",
+                   ".go:", "no test files", "PASS", "Traceback", "AssertionError",
+                   "npm ERR", "failing", "passing", "✓", "✗", "Tests:", "panicked")
+        keep = [l for l in tail.splitlines()
+                if any(m in l for m in markers)
+                and "debconf" not in l and "crabbox" not in l]
+        if not keep:                       # never hand the fixer an empty brief
+            keep = tail.splitlines()[-40:]
         return j.get("verdict", "error"), "\n".join(keep[-40:])[:2500]
     except Exception:
         return "error", (err or out)[-800:]
 
 def fix_round(failures, rnd):
-    brief = (f"You are fixing a Go project that fails its tests. SHARED CONTRACT:\n\n{CONTRACT}\n\n"
-             f"The full repo is in your working directory. `go test ./...` FAILS with:\n\n{failures}\n\n"
+    brief = (f"You are fixing a {LANG} project that fails its tests. SHARED CONTRACT:\n\n{CONTRACT}\n\n"
+             f"The full repo is in your working directory. The test command (`{TEST_CMD}`) FAILS with:\n\n"
+             f"{failures}\n\n"
              "Fix the compile/test errors across whatever files are responsible so the WHOLE suite passes. "
-             "Keep the contract signatures intact. Do NOT modify go.mod/go.sum or run go mod tidy.")
+             "Keep the contract signatures/interfaces intact. Do NOT modify dependency manifests or lockfiles.")
     res = ra.dispatch(brief, workdir=REPO, config=CFG)
     return res.runtime
 
@@ -125,8 +142,8 @@ try:
             save()
             alert(f"  ✓ built {r['name']} ({r['runtime']}, status={r['status']})")
     codex_n = sum(1 for m in state["modules"].values() if m["runtime"] == "codex")
-    files_n = len([p for p in Path(REPO).rglob("*.go")])
-    alert(f"⌨️ Build done — {len(MODULES)} modules, {codex_n} on codex, {files_n} .go files written. Integrating + testing in VM.")
+    files_n = sum(1 for p in Path(REPO).rglob("*") if p.is_file() and ".git" not in p.parts)
+    alert(f"⌨️ Build done — {len(MODULES)} modules, {codex_n} on codex, {files_n} files written ({LANG}). Integrating + testing in VM.")
 
     # Phase 2: integrate + test, with a bounded fix-loop
     state["phase"] = "verify"; save()
@@ -142,8 +159,8 @@ try:
 
     state["phase"] = "done"; state["final_verdict"] = verdict; save()
     if verdict == "pass":
-        alert(f"🎉 FLEET BUILD PASS — `cfgcheck` built from scratch by {codex_n} parallel codex agents, "
-              f"GREEN `go test ./...` after {rnd} fix round(s). Multi-agent greenfield construction proven.")
+        alert(f"🎉 FLEET BUILD PASS — `{_PROJECT}` ({LANG}) built from scratch by {codex_n} parallel "
+              f"codex agents, GREEN `{TEST_CMD}` after {rnd} fix round(s). Multi-agent greenfield construction proven.")
     else:
         alert(f"🏁 FLEET BUILD ended {verdict} after {rnd} fix rounds. Last failures:\n{detail[:700]}")
 except Exception as e:
