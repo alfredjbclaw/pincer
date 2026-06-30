@@ -69,3 +69,28 @@ else:
                 return None
             print("[alert]", body)
             return None
+
+
+if _BACKEND is not None and hasattr(_BACKEND, "LiveBoard"):
+    LiveBoard = _BACKEND.LiveBoard
+else:
+    class LiveBoard:  # type: ignore[no-redef]
+        """No-op stand-in for the real LiveBoard (a single live-updating status
+        message). Same `post(body, level=...)` interface as AlertThread, so it's
+        a drop-in; without a backend it just prints the board lines."""
+
+        _ORDER = {"progress": 0, "milestone": 1, "critical": 2}
+
+        def __init__(self, tag=None, topic_id=None, min_level="milestone", silent=True):
+            self.tag = tag
+            self.topic_id = topic_id
+            self.min_level = min_level
+            self.silent = silent
+            self.lines = []
+
+        def post(self, body, level="progress"):
+            if self._ORDER.get(level, 0) < self._ORDER.get(self.min_level, 0):
+                return True
+            self.lines.append(body)
+            print("[board]", body)
+            return True

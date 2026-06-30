@@ -102,10 +102,20 @@ topic_id = 1101
 
 # verbosity:
 #   "quiet"   (default) — milestones + criticals only (loop START / DONE / held,
-#             plus 🚨 INFRA FAILURE and crashes). ~2 messages per run.
+#             plus 🚨 INFRA FAILURE and crashes).
 #   "verbose" — every stage + per-candidate line. A debug feed; turn on when
 #             diagnosing a loop, off the rest of the time.
 verbosity = "quiet"
+
+# style — how those messages are delivered:
+#   "live"   (default) — ONE status message that edits itself in place as the run
+#            progresses. Sent silently, so a normal run never buzzes your phone;
+#            a real failure (critical) still sends one discrete notification.
+#   "thread" — the classic reply-chain of separate messages (one per milestone).
+# Either way the FULL blow-by-blow (every stage + candidate) is written to a
+# local markdown log under ~/.openclaw/pincer/run-logs/ (auto-pruned to the last
+# 50 runs) for debugging — independent of what reaches Telegram.
+style = "live"
 
 [cadence]
 mission = "daily"

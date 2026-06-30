@@ -42,10 +42,12 @@ import localization as lz
 import selection as sel
 import repro_test as rp
 
-from notify import send_alert, AlertThread
+from notify import send_alert, AlertThread, LiveBoard
 
-# All of a run's alerts thread under its "loop START" root (set in run()).
+# A run's alert surface (a LiveBoard or AlertThread), set in run().
 _THREAD = None
+# Path to the current run's local detail log (set in run()).
+_RUN_LOG = None
 
 # Dedicated, muteable 'Pincer' forum topic — keeps pincer's run chatter out of
 # the shared Alerts topic so it never spams the phone. Override via [alerts] in
@@ -54,9 +56,10 @@ PINCER_ALERTS_TOPIC = 1101
 
 
 def _alerts_config():
-    """(topic_id, verbosity) from [alerts] in pincer.toml. Defaults: the
-    dedicated Pincer topic + 'quiet' (milestones + criticals only)."""
-    topic, verbosity = PINCER_ALERTS_TOPIC, "quiet"
+    """(topic_id, verbosity, style) from [alerts] in pincer.toml. Defaults: the
+    dedicated Pincer topic, 'quiet' (milestones + criticals), 'live' (one
+    edit-in-place status message instead of many — no phone spam)."""
+    topic, verbosity, style = PINCER_ALERTS_TOPIC, "quiet", "live"
     try:
         import os
         try:
@@ -68,20 +71,59 @@ def _alerts_config():
             a = tomllib.loads(p.read_text()).get("alerts", {})
             topic = int(a.get("topic_id", topic))
             verbosity = str(a.get("verbosity", verbosity))
+            style = str(a.get("style", style))
     except Exception:
         pass
-    return topic, verbosity
+    return topic, verbosity, style
 
 
 def make_alert_thread(tag):
-    """Build a run's AlertThread routed to the Pincer topic at the configured
-    verbosity. quiet -> milestones + criticals only; verbose -> everything (a
-    debug feed). Returns None if alerts are unavailable."""
-    if AlertThread is None:
+    """Build a run's alert surface routed to the Pincer topic at the configured
+    verbosity + style. style 'live' -> a single edit-in-place LiveBoard (default;
+    one silent message that updates, criticals buzz separately); 'thread' -> the
+    classic reply-thread of separate messages. Returns None if unavailable."""
+    if LiveBoard is None and AlertThread is None:
         return None
-    topic, verbosity = _alerts_config()
+    topic, verbosity, style = _alerts_config()
     min_level = "progress" if verbosity == "verbose" else "milestone"
-    return AlertThread(tag, topic_id=topic, min_level=min_level)
+    if style == "thread" and AlertThread is not None:
+        return AlertThread(tag, topic_id=topic, min_level=min_level)
+    return LiveBoard(tag, topic_id=topic, min_level=min_level)
+
+
+def _start_run_log(repo: str, ts: str) -> None:
+    """Open a per-run local detail log (full progress, including lines the quiet
+    board hides). Pruned to the most recent runs so it never grows unbounded.
+    `ts` is passed in (caller stamps it) to keep this side-effect-free of clocks."""
+    global _RUN_LOG
+    try:
+        d = Path.home() / ".openclaw" / "pincer" / "run-logs"
+        d.mkdir(parents=True, exist_ok=True)
+        _prune_run_logs(d, keep=50)
+        _RUN_LOG = d / f"{ts}-{repo.replace('/', '_')}.md"
+        _RUN_LOG.write_text(f"# Pincer run — {repo} — {ts}\n\n")
+    except Exception:
+        _RUN_LOG = None
+
+
+def _prune_run_logs(d: Path, keep: int = 50) -> None:
+    """Keep only the `keep` most-recent run logs (each is a few KB)."""
+    try:
+        logs = sorted(d.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in logs[keep:]:
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _run_log(msg: str, level: str) -> None:
+    if _RUN_LOG is None:
+        return
+    try:
+        with open(_RUN_LOG, "a") as f:
+            f.write(f"- `{level}` {msg}\n")
+    except Exception:
+        pass
 
 # The Crabbox stage is the only hard-serial section (host memory ceiling).
 SANDBOX_LOCK = threading.Lock()
@@ -95,6 +137,9 @@ def sh(cmd, cwd=None, timeout=1800):
 
 
 def alert(msg, level="progress"):
+    # Full detail always goes to the local run log (free, on disk); the board
+    # shows only milestones/criticals (no phone spam).
+    _run_log(msg, level)
     try:
         if _THREAD is not None:
             _THREAD.post(msg, level=level)
@@ -698,6 +743,8 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     # otherwise start our own root here.
     global _THREAD
     _THREAD = thread if thread is not None else make_alert_thread(f"🔧 {repo.split('/')[-1]}")
+    import datetime
+    _start_run_log(repo, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
     # Self-heal the workdir BEFORE anything reads it: re-clone if missing/broken,
     # else fetch + hard-reset. Returns a default branch guaranteed to resolve.
