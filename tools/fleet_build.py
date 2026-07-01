@@ -87,8 +87,13 @@ def save(): STATE.write_text(json.dumps(state, indent=2, default=str))
 
 def build_module(mod):
     name, files, task = mod
+    import prior_art
+    prior_art_context = prior_art.prior_art_block(
+        f"{CONTRACT}\n\n{task}",
+        Path(REPO).name,
+    )
     brief = (f"You are building one part of a {LANG} project. SHARED CONTRACT all parts must match:\n\n"
-             f"{CONTRACT}\n\nYOUR TASK: create exactly these file(s): {files}\n{task}\n\n"
+             f"{CONTRACT}{prior_art_context}\n\nYOUR TASK: create exactly these file(s): {files}\n{task}\n\n"
              "Match the contract signatures/interfaces EXACTLY. Use only the standard library plus the "
              "dependencies already declared in the project's manifest/lockfile. Do NOT modify dependency "
              "manifests or lockfiles, do NOT create any other files. Write idiomatic code with real tests "
