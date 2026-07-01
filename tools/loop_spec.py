@@ -178,8 +178,33 @@ def run_spec(spec: LoopSpec, thread=None) -> dict:
         return {"name": spec.name, "result": "no_work"}
     now_ts = datetime.now().isoformat(timespec="seconds")
     kept = []
+    escalated = []
     for issue in issues:
-        skip, reason = work_history.should_skip(_history_rows(spec.repo, issue), now_ts=now_ts)
+        rows = _history_rows(spec.repo, issue)
+        if work_history.is_escalated(rows):
+            post(f"⏭️ Loop '{spec.name}': skipping {spec.repo}#{issue} — already escalated; "
+                 "waiting for human clear.", "milestone")
+            escalated.append(issue)
+            continue
+
+        should_escalate, escalation_reason, failed_count = work_history.should_escalate(rows)
+        if should_escalate:
+            detail = f"{escalation_reason} after {failed_count} failed attempts"
+            work_history.record_escalation(
+                spec.repo,
+                issue,
+                run_id=f"{spec.name}:{now_ts}",
+                reason=detail,
+                attempts=failed_count,
+                ts=now_ts,
+            )
+            post(f"🚨 NEEDS HUMAN: issue {spec.repo}#{issue} escalated after "
+                 f"{failed_count} failed attempts ({escalation_reason}). It will not be "
+                 "retried until cleared.", "critical")
+            escalated.append(issue)
+            continue
+
+        skip, reason = work_history.should_skip(rows, now_ts=now_ts)
         if skip:
             post(f"⏭️ Loop '{spec.name}': skipping {spec.repo}#{issue} — work history says {reason}.",
                  "milestone")
@@ -187,11 +212,16 @@ def run_spec(spec: LoopSpec, thread=None) -> dict:
             kept.append(issue)
     issues = kept
     if not issues:
+        if escalated:
+            return {"name": spec.name, "result": "escalated", "escalated": escalated}
         post(f"✅ Loop '{spec.name}': nothing to do (work history skipped all resolved issues).",
              "milestone")
         return {"name": spec.name, "result": "no_work"}
 
     state = po.run(spec.repo, spec.workdir, issues, spec.max_coders,
                    allow_merge=(spec.autonomy == "auto"), thread=thread)
-    return {"name": spec.name, "result": state.get("result"),
-            "scorecard": state.get("scorecard", {})}
+    result = {"name": spec.name, "result": state.get("result"),
+              "scorecard": state.get("scorecard", {})}
+    if escalated:
+        result["escalated"] = escalated
+    return result
