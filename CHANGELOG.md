@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.3 — 2026-07-01
+
+Loop-reliability overhaul: the loop now learns from its own past attempts and
+can no longer wedge, double-run, or silently swallow errors. Triggered by the
+sql-metadata loop that wedged ~57 min on a single issue (#8).
+
+### New
+
+- **Per-issue work history + anti-repeat learning** (`tools/work_history.py`).
+  Every issue attempt is recorded (runtime, normalized patch hash, sandbox
+  result, review verdict, outcome, reason). Before dispatch, `run_spec` skips
+  issues that are exhausted (`max_attempts`), cooling down after a recent
+  failure (`cooldown_hours`), or that would re-submit an already-failed patch
+  (`seen_patch`). Prior-failure context is injected into both the initial and
+  revision coder briefs so a fresh attempt starts from what already didn't work.
+- **In-flight registry + run watchdog** (`tools/inflight.py`). The loop driver
+  claims a per-repo/-loop key before running, heartbeats during, and releases in
+  a `finally`. Stale claims are reaped at each tick start; a run exceeding
+  `PINCER_RUN_TIMEOUT_S` (default 1800s) raises `RunTimeout`, unblocks the tick,
+  and fires a best-effort reap — so one wedged issue can never stall the driver.
+- **Orphan-safe codex dispatch** (`tools/runtime_adapter.py`). Codex runs are
+  dispatched so that an errored/fallback path can no longer leave a dead process
+  holding its lock — the direct fix for the #8 wedge.
+
+### Hardened
+
+- **Real rotating driver logs** (`~/.openclaw/pincer/logs/loop-driver.log`,
+  1 MB × 5, override via `PINCER_LOOP_LOG`). Tick start/quiet/skip/timeout/crash
+  and per-loop results are now logged.
+- **De-swallowed exceptions.** Bare `except: pass` swallows across the driver,
+  orchestrator, and loop spec now log via `LOG.exception` instead of vanishing.
+
+### Tuning
+
+- New env knobs: `PINCER_RUN_TIMEOUT_S` (run watchdog timeout),
+  `PINCER_INFLIGHT_MAX_AGE_S` (stale-claim reap age), `PINCER_LOOP_LOG`
+  (driver log path).
+
 ## 0.2.2 — 2026-06-29
 
 Multi-language sandbox provisioning, loop health, and memory-aware concurrency.
