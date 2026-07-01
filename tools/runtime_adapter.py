@@ -44,6 +44,8 @@ import time
 from pathlib import Path
 from typing import Final, Iterable, Optional
 
+import global_gate
+
 PINCER_CONFIG_DEFAULT = Path.home() / ".openclaw" / "pincer.toml"
 PINCER_STATE_DIR = Path.home() / ".openclaw" / "pincer"
 CLAUDE_CODE_WRAPPER = Path.home() / ".openclaw" / "workspace" / "tools" / "claude-code-wrapper.py"
@@ -111,6 +113,9 @@ class RuntimeConfig:
     codex_sandbox: str = "workspace-write"
     timeout_seconds: int = 1800
     max_strikes: int = 3
+    global_max_concurrent: int = 4
+    global_gate_wait_seconds: int = 600
+    global_gate_stale_seconds: int = 600
 
     @classmethod
     def from_pincer_toml(cls, path: Optional[Path] = None) -> "RuntimeConfig":
@@ -135,6 +140,9 @@ class RuntimeConfig:
             fallback_enabled=bool(rt.get("fallback", "claude-code")),
             ultrawork=bool(rt.get("ultrawork", True)),
             codex_model=codex_model,
+            global_max_concurrent=int(rt.get("global_max_concurrent", 4)),
+            global_gate_wait_seconds=int(rt.get("global_gate_wait_seconds", 600)),
+            global_gate_stale_seconds=int(rt.get("global_gate_stale_seconds", 600)),
         )
 
 
@@ -393,42 +401,66 @@ def dispatch(
         raise ValueError(f"workdir does not exist or is not a directory: {workdir}")
     started = time.monotonic()
 
-    # Primary attempt.
-    primary_text, primary_stderr, primary_exit = _execute(cfg.primary, prompt, workdir, cfg)
-    primary_contract = _extract_contract(primary_text)
-    trigger = _detect_fallback_trigger(primary_stderr, primary_text)
-    primary_ok = primary_exit == 0 and primary_contract["status"] in SUCCESS_STATUSES
+    # Match the VM RAM gate's backpressure posture: wait for capacity instead of
+    # over-dispatching. Unlike RAM, this is a hard global ceiling, so timeout
+    # returns a blocked dispatch rather than proceeding past the cap.
+    try:
+        gate = global_gate.slot(
+            max_slots=cfg.global_max_concurrent,
+            wait_timeout_s=cfg.global_gate_wait_seconds,
+            label=f"{cfg.primary}:{workdir.name}",
+            max_age_s=cfg.global_gate_stale_seconds,
+        )
+        with gate:
+            # Primary attempt.
+            primary_text, primary_stderr, primary_exit = _execute(cfg.primary, prompt, workdir, cfg)
+            primary_contract = _extract_contract(primary_text)
+            trigger = _detect_fallback_trigger(primary_stderr, primary_text)
+            primary_ok = primary_exit == 0 and primary_contract["status"] in SUCCESS_STATUSES
 
-    if primary_ok or not cfg.fallback_enabled or cfg.primary == cfg.fallback:
+            if primary_ok or not cfg.fallback_enabled or cfg.primary == cfg.fallback:
+                return RunResult(
+                    runtime=cfg.primary,
+                    status=primary_contract["status"],
+                    files=primary_contract["files"],
+                    validation=primary_contract["validation"],
+                    next=primary_contract["next"],
+                    final_text=primary_text,
+                    fallback_used=False,
+                    fallback_reason=None,
+                    duration_seconds=time.monotonic() - started,
+                    exit_code=primary_exit,
+                )
+
+            # Fallback decision: trigger detected, or hard error.
+            reason = trigger or ("nonzero_exit" if primary_exit != 0 else "blocked_status")
+            fb_text, fb_stderr, fb_exit = _execute(cfg.fallback, prompt, workdir, cfg)
+            fb_contract = _extract_contract(fb_text)
+            return RunResult(
+                runtime=cfg.fallback,
+                status=fb_contract["status"],
+                files=fb_contract["files"],
+                validation=fb_contract["validation"],
+                next=fb_contract["next"],
+                final_text=fb_text,
+                fallback_used=True,
+                fallback_reason=reason,
+                duration_seconds=time.monotonic() - started,
+                exit_code=fb_exit,
+            )
+    except global_gate.GateTimeout as exc:
         return RunResult(
             runtime=cfg.primary,
-            status=primary_contract["status"],
-            files=primary_contract["files"],
-            validation=primary_contract["validation"],
-            next=primary_contract["next"],
-            final_text=primary_text,
+            status="blocked",
+            files=[],
+            validation="none",
+            next=str(exc),
+            final_text=str(exc),
             fallback_used=False,
-            fallback_reason=None,
+            fallback_reason="global_gate_timeout",
             duration_seconds=time.monotonic() - started,
-            exit_code=primary_exit,
+            exit_code=75,
         )
-
-    # Fallback decision: trigger detected, or hard error.
-    reason = trigger or ("nonzero_exit" if primary_exit != 0 else "blocked_status")
-    fb_text, fb_stderr, fb_exit = _execute(cfg.fallback, prompt, workdir, cfg)
-    fb_contract = _extract_contract(fb_text)
-    return RunResult(
-        runtime=cfg.fallback,
-        status=fb_contract["status"],
-        files=fb_contract["files"],
-        validation=fb_contract["validation"],
-        next=fb_contract["next"],
-        final_text=fb_text,
-        fallback_used=True,
-        fallback_reason=reason,
-        duration_seconds=time.monotonic() - started,
-        exit_code=fb_exit,
-    )
 
 
 def _cli() -> int:
