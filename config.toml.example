@@ -28,6 +28,14 @@ tool = "anthropic/claude-haiku-4-5"
 primary = "codex"
 fallback = "claude-code"
 
+# Host-global worker dispatch ceiling. This is a shared file-backed gate under
+# ~/.openclaw/pincer/, so independent loop-driver processes cannot jointly
+# saturate Codex. Pincer waits for a slot, then defers the dispatch if the wait
+# expires instead of bursting past the cap.
+global_max_concurrent = 4
+global_gate_wait_seconds = 600
+global_gate_stale_seconds = 600
+
 # Automatic fallback triggers. Any one fires the fallback for the current task only.
 fallback_on = [
   "credit_exhausted",
