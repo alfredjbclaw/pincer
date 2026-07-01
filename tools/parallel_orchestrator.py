@@ -257,6 +257,8 @@ def issue_brief(repo: str, n: int, workdir: str | None = None,
     hint_block = ""
     if workdir:
         hint_block = lz.localize(workdir, f"{title} {body}").hint_block()
+    import prior_art
+    prior_art_context = prior_art.prior_art_block(f"{title}\n\n{body}", repo)
     diversify = ""
     if sample > 0:
         diversify = (f"\n(Independent attempt #{sample + 1} at this fix — explore a "
@@ -264,6 +266,7 @@ def issue_brief(repo: str, n: int, workdir: str | None = None,
     history_context = _failure_context(repo, n)
     history_block = f"\n\n{history_context}\n\n" if history_context else ""
     brief = (f"Fix {repo} issue #{n}: {title}\n\n{body}\n\n{hint_block}{diversify}"
+             f"{prior_art_context}"
              f"{history_block}"
              "Keep the change minimal and idiomatic. REQUIRED: add a test that captures "
              "this bug — one that FAILS on the current code and PASSES after your fix. If "

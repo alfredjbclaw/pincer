@@ -109,6 +109,19 @@ interpret_failures = true
 # Model used to author reproduction tests + interpret failures.
 repro_model = "anthropic/claude-opus-4-8"
 
+[prior_art]
+# Optional public prior-art harvesting for worker briefs. Default: off. When
+# enabled, pincer uses GitHub search through the gh CLI, ranks candidates by
+# repository health (stars, recency, visible tests), fetches a few key files,
+# and appends a compact cited pattern brief. It never emits source code for
+# transplanting.
+enabled = false
+max_repos = 3
+search_limit = 10
+max_files_per_repo = 3
+cache_dir = "~/.openclaw/pincer/prior-art"
+refresh = false
+
 [alerts]
 # Where pincer posts run progress, and how chatty it is. By default everything
 # goes to a dedicated, muteable "Pincer" Telegram topic (not the shared Alerts
