@@ -25,10 +25,12 @@ import argparse
 import concurrent.futures as cf
 import dataclasses
 import json
+import logging
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 THIS = Path(__file__).resolve().parent
@@ -42,8 +44,11 @@ import reviewer as rv
 import localization as lz
 import selection as sel
 import repro_test as rp
+import work_history
 
 from notify import send_alert, AlertThread, LiveBoard
+
+LOG = logging.getLogger("pincer.orchestrator")
 
 # A run's alert surface (a LiveBoard or AlertThread), set in run().
 _THREAD = None
@@ -74,6 +79,7 @@ def _alerts_config():
             verbosity = str(a.get("verbosity", verbosity))
             style = str(a.get("style", style))
     except Exception:
+        LOG.exception("Failed to load alerts config")
         pass
     return topic, verbosity, style
 
@@ -104,6 +110,7 @@ def _start_run_log(repo: str, ts: str) -> None:
         _RUN_LOG = d / f"{ts}-{repo.replace('/', '_')}.md"
         _RUN_LOG.write_text(f"# Pincer run — {repo} — {ts}\n\n")
     except Exception:
+        LOG.exception("Failed to start run log for %s", repo)
         _RUN_LOG = None
 
 
@@ -114,6 +121,7 @@ def _prune_run_logs(d: Path, keep: int = 50) -> None:
         for old in logs[keep:]:
             old.unlink(missing_ok=True)
     except Exception:
+        LOG.exception("Failed to prune run logs in %s", d)
         pass
 
 
@@ -124,6 +132,7 @@ def _run_log(msg: str, level: str) -> None:
         with open(_RUN_LOG, "a") as f:
             f.write(f"- `{level}` {msg}\n")
     except Exception:
+        LOG.exception("Failed to write run log message")
         pass
 
 PUBLISH_LOCK = threading.Lock()   # git merge to the shared main must serialize
@@ -159,6 +168,7 @@ def _sandbox_gate_config():
             cfg["vm_memory_gb"] = float(s.get("vm_memory_gb", cfg["vm_memory_gb"]))
             cfg["max_wait_s"] = int(s.get("vm_gate_max_wait_s", cfg["max_wait_s"]))
     except Exception:
+        LOG.exception("Failed to load sandbox gate config")
         pass
     return cfg
 
@@ -214,6 +224,7 @@ def alert(msg, level="progress"):
         else:
             send_alert(msg)
     except Exception as e:
+        LOG.exception("Failed to send alert")
         print("alert failed:", e)
 
 
@@ -250,7 +261,10 @@ def issue_brief(repo: str, n: int, workdir: str | None = None,
     if sample > 0:
         diversify = (f"\n(Independent attempt #{sample + 1} at this fix — explore a "
                      "different approach if the obvious one looks fragile.)\n")
+    history_context = _failure_context(repo, n)
+    history_block = f"\n\n{history_context}\n\n" if history_context else ""
     brief = (f"Fix {repo} issue #{n}: {title}\n\n{body}\n\n{hint_block}{diversify}"
+             f"{history_block}"
              "Keep the change minimal and idiomatic. REQUIRED: add a test that captures "
              "this bug — one that FAILS on the current code and PASSES after your fix. If "
              "a matching xfail test exists, remove the xfail marker. You do NOT need to "
@@ -412,6 +426,7 @@ def usage_ok() -> bool:
             capture_output=True, timeout=60).returncode
         return rc != 2  # 2 == window/week >= 80%
     except Exception:
+        LOG.exception("Usage gate failed")
         return True  # fail open — never block on a gate error
 
 
@@ -452,6 +467,7 @@ def stage_sandbox(cand: dict, test_cmd: str) -> dict:
         cand["results"] = j.get("results")  # structured counts for regression ranking
         cand["sandbox_fail"] = _extract_test_failure(j.get("stdout_tail", "") + "\n" + j.get("stderr_tail", ""))
     except Exception:
+        LOG.exception("Failed to parse sandbox output for issue #%s", cand.get("issue"))
         cand["sandbox"] = "error"
         cand["results"] = None
         cand["sandbox_fail"] = (err or out)[-500:]
@@ -689,6 +705,7 @@ class SelectionTuning:
         try:
             data = tomllib.loads(p.read_text())
         except Exception:
+            LOG.exception("Failed to load selection tuning from %s", p)
             return cls()
         s = data.get("selection", {})
         return cls(
@@ -780,6 +797,7 @@ def stage_repro(issue: int, issue_cands: list[dict], repo: str, main_workdir: Pa
         sh(["git", "-C", str(main_workdir), "worktree", "remove", "--force", str(base_wt)])
         return True
     except Exception as e:
+        LOG.exception("Reproduction stage failed on issue #%s", issue)
         alert(f"  ⚠️ repro stage error on #{issue}: {e}")
         return False
 
@@ -801,6 +819,95 @@ def finalize_chosen(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg,
     return cand
 
 
+def _history_rows(repo: str, issue: int) -> list[dict]:
+    rows = work_history.attempts(repo, issue)
+    if not isinstance(issue, str):
+        rows += work_history.attempts(repo, str(issue))
+    return rows
+
+
+def _failure_context(repo: str, issue: int) -> str:
+    return work_history.failure_context(_history_rows(repo, issue))
+
+
+def _review_summary(cand: dict | None) -> str:
+    if not cand:
+        return ""
+    review = cand.get("review")
+    if isinstance(review, dict):
+        verdict = review.get("verdict", "")
+        blockers = review.get("blockers") or []
+        if blockers:
+            return f"{verdict}: {', '.join(str(b) for b in blockers)}"
+        return str(verdict)
+    rvobj = cand.get("_review_obj")
+    if rvobj is not None:
+        blockers = getattr(rvobj, "blockers", None) or []
+        verdict = getattr(rvobj, "verdict", "")
+        if blockers:
+            return f"{verdict}: {', '.join(str(b) for b in blockers)}"
+        return str(verdict)
+    return str(review or "")
+
+
+def _candidate_reason(cand: dict | None, outcome: str) -> str:
+    if cand is None:
+        return outcome
+    if outcome == "shipped":
+        return str(cand.get("published") or "published")
+    if outcome == "failed":
+        return str(cand.get("sandbox_fail") or cand.get("sandbox") or "verification failed")[:240]
+    if outcome == "rejected":
+        return _review_summary(cand)[:240] or "review rejected"
+    if outcome == "error":
+        return str(cand.get("error") or cand.get("sandbox_fail") or "infrastructure error")[:240]
+    return outcome
+
+
+def _record_work_history(repo: str, issues: list[int], cands: list[dict], chosen: list[dict],
+                         scorecard: dict, run_id: str, ts: str) -> None:
+    by_issue: dict[int, list[dict]] = {}
+    for cand in cands:
+        by_issue.setdefault(cand["issue"], []).append(cand)
+    chosen_by_issue = {cand["issue"]: cand for cand in chosen}
+    infra_issues = set(scorecard.get("infra_failures", []) or [])
+    failed_issues = set(scorecard.get("failed_verification", []) or [])
+    shipped_issues = set(scorecard.get("merged", []) or []) | set(scorecard.get("prd", []) or [])
+    no_winner_issues = set(scorecard.get("no_winner", []) or [])
+
+    for issue in issues:
+        cand = chosen_by_issue.get(issue)
+        if cand is None and by_issue.get(issue):
+            cand = by_issue[issue][0]
+        if issue in shipped_issues:
+            outcome = "shipped"
+        elif issue in infra_issues:
+            outcome = "error"
+        elif issue in failed_issues:
+            outcome = "failed"
+        elif issue in no_winner_issues:
+            outcome = "no_winner"
+        elif cand and (cand.get("review") or {}).get("verdict") == "reject":
+            outcome = "rejected"
+        else:
+            outcome = "failed"
+        try:
+            work_history.record(
+                repo=repo,
+                issue=issue,
+                run_id=run_id,
+                runtime=(cand or {}).get("runtime", ""),
+                patch_hash=sel.normalize_patch((cand or {}).get("patch", "") or ""),
+                sandbox=(cand or {}).get("sandbox", ""),
+                review=_review_summary(cand),
+                outcome=outcome,
+                reason=_candidate_reason(cand, outcome),
+                ts=ts,
+            )
+        except Exception:
+            LOG.exception("Failed to record work history for %s#%s", repo, issue)
+
+
 def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge: bool,
         tuning: "SelectionTuning | None" = None, thread=None):
     tuning = tuning or SelectionTuning.load()
@@ -811,8 +918,7 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
     # otherwise start our own root here.
     global _THREAD
     _THREAD = thread if thread is not None else make_alert_thread(f"🔧 {repo.split('/')[-1]}")
-    import datetime
-    _start_run_log(repo, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    _start_run_log(repo, datetime.now().strftime("%Y%m%d-%H%M%S"))
     _init_sandbox_gate()  # size the memory-aware VM semaphore from [sandbox] config
 
     # Self-heal the workdir BEFORE anything reads it: re-clone if missing/broken,
@@ -861,6 +967,7 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
             try:
                 c = fut.result()
             except Exception as e:
+                LOG.exception("Coding stage failed for %s#%s sample %s", repo, n, s)
                 c = {"issue": n, "sample": s, "worker_status": "error",
                      "error": str(e), "committed": False}
             cands.append(c)
@@ -939,6 +1046,15 @@ def run(repo: str, workdir: str, issues: list[int], max_coders: int, allow_merge
                           "failed_verification": [c["issue"] for c in failed],
                           "no_winner": no_winner,
                           "infra_failures": sorted({c["issue"] for c in infra})}
+    _record_work_history(
+        repo,
+        issues,
+        cands,
+        chosen,
+        state["scorecard"],
+        run_id=_RUN_LOG.stem if _RUN_LOG is not None else f"{repo}-{_now_stamp()}",
+        ts=datetime.now().isoformat(timespec="seconds"),
+    )
     # Loud escalation: if NOTHING shipped and the cause was infrastructure (not
     # "no fix found"), this is a pincer/env problem — say so plainly instead of a
     # quiet 'no winner'. This is exactly what the sql-metadata clone failure

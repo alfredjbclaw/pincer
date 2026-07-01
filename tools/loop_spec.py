@@ -23,7 +23,8 @@ Spec lives at ~/.openclaw/pincer/loops/<name>.json:
 }
 """
 from __future__ import annotations
-import os, json, subprocess, sys, dataclasses
+import os, json, subprocess, sys, dataclasses, logging
+from datetime import datetime
 from pathlib import Path
 
 THIS = Path(__file__).resolve().parent
@@ -31,10 +32,12 @@ sys.path.insert(0, str(THIS))
 import parallel_orchestrator as po
 import audit as audit_mod
 import preflight
+import work_history
 
 LOOPS_DIR = Path.home() / ".openclaw" / "pincer" / "loops"
 # Optional external usage gate; set $PINCER_USAGE_GATE to its path to enable.
 USAGE_GATE = os.environ.get("PINCER_USAGE_GATE")
+LOG = logging.getLogger("pincer.loop_spec")
 
 from notify import send_alert
 
@@ -89,6 +92,7 @@ def budget_ok(spec: LoopSpec) -> tuple[bool, str]:
                 return False, f"usage window={w}% week={wk}% >= budget {spec.budget}"
             return True, f"usage window={w}% week={wk}% (within budget)"
     except Exception as e:
+        LOG.exception("Budget check failed for loop %s", spec.name)
         return True, f"budget check skipped ({e})"
     return True, "budget unknown (allowing)"
 
@@ -116,8 +120,16 @@ def _resolve_issues(spec: LoopSpec) -> list[int]:
         try:
             return sorted(i["number"] for i in json.loads(out))
         except Exception:
+            LOG.exception("Failed to parse issue list for %s", spec.repo)
             return []
     return [int(x) for x in spec.target.split(",") if x.strip()]
+
+
+def _history_rows(repo: str, issue: int) -> list[dict]:
+    rows = work_history.attempts(repo, issue)
+    if not isinstance(issue, str):
+        rows += work_history.attempts(repo, str(issue))
+    return rows
 
 
 def run_spec(spec: LoopSpec, thread=None) -> dict:
@@ -163,6 +175,20 @@ def run_spec(spec: LoopSpec, thread=None) -> dict:
     issues = _resolve_issues(spec)
     if not issues:
         post(f"✅ Loop '{spec.name}': nothing to do ({spec.mode} found no work).", "milestone")
+        return {"name": spec.name, "result": "no_work"}
+    now_ts = datetime.now().isoformat(timespec="seconds")
+    kept = []
+    for issue in issues:
+        skip, reason = work_history.should_skip(_history_rows(spec.repo, issue), now_ts=now_ts)
+        if skip:
+            post(f"⏭️ Loop '{spec.name}': skipping {spec.repo}#{issue} — work history says {reason}.",
+                 "milestone")
+        else:
+            kept.append(issue)
+    issues = kept
+    if not issues:
+        post(f"✅ Loop '{spec.name}': nothing to do (work history skipped all resolved issues).",
+             "milestone")
         return {"name": spec.name, "result": "no_work"}
 
     state = po.run(spec.repo, spec.workdir, issues, spec.max_coders,
