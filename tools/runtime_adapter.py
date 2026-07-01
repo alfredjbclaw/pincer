@@ -35,17 +35,20 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Final, Iterable, Optional
 
 PINCER_CONFIG_DEFAULT = Path.home() / ".openclaw" / "pincer.toml"
 PINCER_STATE_DIR = Path.home() / ".openclaw" / "pincer"
 CLAUDE_CODE_WRAPPER = Path.home() / ".openclaw" / "workspace" / "tools" / "claude-code-wrapper.py"
+CODEX_ARG0_DIR: Final = Path.home() / ".codex" / "tmp" / "arg0"
+_CODEX_LOCK_STALE_SECONDS: Final = 5.0
 
 COMPLETION_MARKERS = ("STATUS:", "FILES:", "VALIDATION:", "NEXT:")
 SUCCESS_STATUSES = {"done", "no_changes"}
@@ -195,11 +198,51 @@ def _extract_contract(final_text: str) -> dict:
 _CODEX_SEMAPHORE = threading.Semaphore(int(os.environ.get("PINCER_CODEX_CONCURRENCY", "4")))
 _CODEX_MAX_ATTEMPTS = 3
 _CODEX_BACKOFF_S = 8
+_SUBPROCESS_RUN = subprocess.run
 
 
 def _is_rate_limited(stderr: str, text: str) -> bool:
     haystack = f"{stderr}\n{text}".lower()
     return any(pat in haystack for pat in RATE_LIMIT_PATTERNS)
+
+
+def _kill_process_group(proc: Optional[subprocess.Popen[str]]) -> None:
+    if proc is None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        return
+
+
+def _reap_codex_locks() -> None:
+    now = time.time()
+    try:
+        locks = list(CODEX_ARG0_DIR.glob("*.lock"))
+    except OSError:
+        return
+    for lock in locks:
+        try:
+            stat = lock.stat()
+        except (FileNotFoundError, OSError):
+            continue
+        if now - stat.st_mtime < _CODEX_LOCK_STALE_SECONDS:
+            continue
+        try:
+            if lock.is_dir():
+                lock.rmdir()
+            else:
+                lock.unlink()
+        except (FileNotFoundError, OSError):
+            continue
 
 
 def _run_codex(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str, int]:
@@ -222,6 +265,7 @@ def _codex_once(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, st
     worker_prompt = f"ulw: {prompt}" if cfg.ultrawork else prompt
     with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as last_msg_file:
         last_msg_path = Path(last_msg_file.name)
+    proc: Optional[subprocess.Popen[str]] = None
     try:
         cmd = [
             "codex", "exec",
@@ -232,11 +276,30 @@ def _codex_once(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, st
             "--output-last-message", str(last_msg_path),
             worker_prompt + "\n\n" + WORKER_CONTRACT,
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg.timeout_seconds)
+        if subprocess.run is not _SUBPROCESS_RUN:
+            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg.timeout_seconds)
+            stdout, stderr = completed.stdout, completed.stderr
+            returncode = completed.returncode
+        else:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            stdout, stderr = proc.communicate(timeout=cfg.timeout_seconds)
+            returncode = proc.returncode if proc.returncode is not None else 1
         last_message = last_msg_path.read_text() if last_msg_path.exists() else ""
-        return (last_message or proc.stdout, proc.stderr, proc.returncode)
+        return (last_message or stdout, stderr, returncode)
     except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        _reap_codex_locks()
         return ("", f"codex exec timed out after {cfg.timeout_seconds}s", 124)
+    except Exception as exc:
+        _kill_process_group(proc)
+        _reap_codex_locks()
+        return ("", f"codex exec failed: {exc}", 1)
     finally:
         last_msg_path.unlink(missing_ok=True)
 
@@ -251,20 +314,35 @@ def _run_claude_code(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[st
         "--model", cfg.claude_model,
         prompt + "\n\n" + WORKER_CONTRACT,
     ]
+    proc: Optional[subprocess.Popen[str]] = None
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=cfg.timeout_seconds,
-        )
+        if subprocess.run is not _SUBPROCESS_RUN:
+            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg.timeout_seconds)
+            stdout, stderr = completed.stdout, completed.stderr
+            returncode = completed.returncode
+        else:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            stdout, stderr = proc.communicate(timeout=cfg.timeout_seconds)
+            returncode = proc.returncode if proc.returncode is not None else 1
         # The wrapper emits a JSON envelope; the worker's contract block lives in
         # its `final_text`, not at the top level of stdout. Hand the contract
         # parser the final_text (else STATUS:/FILES: never match -> false error).
-        text, exit_code = _unwrap_wrapper_output(proc.stdout, proc.returncode)
-        return (text, proc.stderr, exit_code)
+        text, exit_code = _unwrap_wrapper_output(stdout, returncode)
+        return (text, stderr, exit_code)
     except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        _reap_codex_locks()
         return ("", f"claude-code wrapper timed out after {cfg.timeout_seconds}s", 124)
+    except Exception as exc:
+        _kill_process_group(proc)
+        _reap_codex_locks()
+        return ("", f"claude-code wrapper failed: {exc}", 1)
 
 
 def _unwrap_wrapper_output(stdout: str, returncode: int) -> tuple[str, int]:
