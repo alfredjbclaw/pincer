@@ -58,6 +58,13 @@ gate = "every"
 # Default test command. Each repo can override via .pincer.toml at its root.
 default_test = "make test"
 
+# Optional reusable ("warm") crabbox box slug from `crabbox warmup`/`prewarm`.
+# When set, pincer provisions the language toolchain onto that box ONCE, then
+# reuses it for every fix-round with no apt prelude — removing the ~2m40s
+# per-round toolchain reinstall that dominates multi-round builds. Leave unset
+# (or set PINCER_SANDBOX_BOX_ID) for a fresh ephemeral lease per run.
+# box_id = "blue-lobster"
+
 # Maximum concurrent Crabbox VMs (per pincer process). Each Apple VZ VM
 # pre-allocates ~8 GiB. This is now MEMORY-AWARE: pincer will run up to this many
 # VMs in parallel, but only starts another while host free RAM can absorb it

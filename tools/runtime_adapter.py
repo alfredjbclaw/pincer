@@ -261,11 +261,19 @@ def _run_codex(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str
     for attempt in range(_CODEX_MAX_ATTEMPTS):
         with _CODEX_SEMAPHORE:  # never exceed the plan's concurrency
             result = _codex_once(prompt, workdir, cfg)
-        text, stderr, _ = result
+        text, stderr, returncode = result
         if not _is_rate_limited(stderr, text):
+            # A clean nonzero exit (credit/auth/error) does not raise, so
+            # _codex_once's timeout/exception reap never fires — yet the failed
+            # run may have orphaned a codex lock right before we fall back to
+            # claude-code. Reap stale locks here so the #8 wedge class can't
+            # linger on the error path, not just the timeout path.
+            if returncode != 0:
+                _reap_codex_locks()
             return result  # success or a non-rate-limit failure: don't retry
         if attempt < _CODEX_MAX_ATTEMPTS - 1:
             time.sleep(_CODEX_BACKOFF_S * (attempt + 1))  # 8s, 16s
+    _reap_codex_locks()  # exhausted rate-limit retries -> fall back; clear stale lock
     return result  # exhausted retries -> caller falls back to claude-code
 
 

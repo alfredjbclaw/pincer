@@ -42,6 +42,40 @@ import toolchain as tc
 PINCER_CONFIG_DEFAULT = Path.home() / ".openclaw" / "pincer.toml"
 TAIL_BYTES = 4000
 
+# Host-side record of which apt packages a *reusable* crabbox box already has,
+# keyed by box id. A warm box keeps its installed toolchain between runs, so
+# after a one-time provision we run the bare test command with no apt prelude —
+# removing the ~2m40s apt reinstall from every fix-round (rounds 2..N). The
+# argv contract forbids `||`/`command -v` guards, so this skip decision must
+# live host-side, not in the in-VM prelude.
+PROVISION_STATE_PATH = Path.home() / ".openclaw" / "pincer" / "provisioned-boxes.json"
+
+
+def _load_provision_state() -> dict:
+    try:
+        return json.loads(PROVISION_STATE_PATH.read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _record_provisioned(box_id: str, pkgs: list) -> None:
+    """Merge `pkgs` into the recorded install set for `box_id` (best-effort)."""
+    state = _load_provision_state()
+    have = set(state.get(box_id, []))
+    have.update(pkgs)
+    state[box_id] = sorted(have)
+    try:
+        PROVISION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PROVISION_STATE_PATH.write_text(json.dumps(state, indent=2))
+    except OSError:
+        pass  # best-effort cache; a miss just means we reprovision next time
+
+
+def _missing_packages(box_id: str, pkgs: list) -> list:
+    """apt packages `box_id` has not been recorded as having, order-preserving."""
+    have = set(_load_provision_state().get(box_id, []))
+    return [p for p in pkgs if p not in have]
+
 
 def reap_stale_leases(provider: str) -> int:
     """Stop any pre-existing crabbox leases for `provider` before a fresh run.
@@ -81,25 +115,33 @@ class SandboxConfig:
     provider: str = "applevz"
     timeout_seconds: int = 1800
     default_test: str = "make test"
+    # Reusable crabbox box slug (from `crabbox warmup`/`prewarm`). When set, the
+    # toolchain is provisioned onto it once and every later run reuses it with
+    # no apt prelude. None -> a fresh ephemeral lease per run (legacy behavior).
+    box_id: Optional[str] = None
 
     @classmethod
     def from_pincer_toml(cls, path: Optional[Path] = None) -> "SandboxConfig":
         cfg_path = path or Path(os.environ.get("PINCER_CONFIG", PINCER_CONFIG_DEFAULT))
+        env_box = os.environ.get("PINCER_SANDBOX_BOX_ID") or None
         if not cfg_path.exists():
-            return cls()
+            return cls(box_id=env_box)
         try:
             import tomllib
         except ImportError:
             try:
                 import tomli as tomllib  # type: ignore
             except ImportError:
-                return cls()
+                return cls(box_id=env_box)
         data = tomllib.loads(cfg_path.read_text())
         sandbox = data.get("sandbox", {})
         return cls(
             provider=sandbox.get("provider", "applevz"),
             timeout_seconds=int(sandbox.get("timeout_seconds", 1800)),
             default_test=sandbox.get("default_test", "make test"),
+            # env override wins so a build session can pin a warm box without
+            # editing config.
+            box_id=env_box or (sandbox.get("box_id") or None),
         )
 
 
@@ -129,6 +171,30 @@ def _tail(s: str, n: int = TAIL_BYTES) -> str:
     return "...[truncated]...\n" + s[-n:]
 
 
+def provision_box(box_id: str, packages: list, cfg: SandboxConfig) -> tuple[bool, str]:
+    """Install `packages` onto a reusable crabbox box once, recording success.
+
+    Runs the apt prelude as its own `crabbox run --id <box_id>` so success is
+    unambiguous (apt chain exit 0) — unlike folding apt into the test command,
+    where a red test verdict can't be told apart from a failed install. Only a
+    clean exit records the packages as present. Returns (ok, detail).
+    """
+    prelude = tc.prelude_for_packages(packages)
+    if not prelude:
+        return (True, "no packages to provision")
+    cmd = ["crabbox", "run", "--id", box_id, "--"] + shlex.split(prelude)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg.timeout_seconds)
+    except subprocess.TimeoutExpired:
+        return (False, f"provision timed out after {cfg.timeout_seconds}s")
+    except Exception as exc:  # crabbox missing / broker error
+        return (False, f"provision failed to launch: {exc}")
+    if proc.returncode == 0:
+        _record_provisioned(box_id, packages)
+        return (True, "provisioned")
+    return (False, _tail(proc.stderr or proc.stdout))
+
+
 def gate(
     workdir: Path | str,
     test_command: Optional[str] = None,
@@ -147,8 +213,6 @@ def gate(
     cfg = config or SandboxConfig.from_pincer_toml()
     workdir = Path(workdir).resolve()
     test_command = test_command or cfg.default_test
-    # Prepend the declarative toolchain prelude (no-op when toolchain is empty).
-    test_command = tc.apply(test_command, toolchain)
     started = time.monotonic()
 
     if reap_stale:
@@ -178,8 +242,31 @@ def gate(
             error_kind="workdir_invalid",
         )
 
-    # `crabbox run --provider <p> -- <test_command>` from within the working tree.
-    cmd = ["crabbox", "run", "--provider", cfg.provider, "--"] + shlex.split(test_command)
+    if cfg.box_id:
+        # Warm-box path: provision only the packages this box still lacks (a
+        # one-time apt cost the first fix-round pays), then run the bare test
+        # command on the reused box every round after — no apt prelude at all.
+        pkgs = tc.resolve_packages(toolchain)
+        missing = _missing_packages(cfg.box_id, pkgs)
+        if missing:
+            ok, detail = provision_box(cfg.box_id, missing, cfg)
+            if not ok:
+                return SandboxVerdict(
+                    verdict="error",
+                    exit_code=1,
+                    duration_seconds=time.monotonic() - started,
+                    provider=cfg.provider,
+                    test_command=test_command,
+                    stdout_tail="",
+                    stderr_tail=f"toolchain provision failed on box {cfg.box_id}: {detail}",
+                    error_kind="provision_failed",
+                )
+        cmd = ["crabbox", "run", "--id", cfg.box_id, "--"] + shlex.split(test_command)
+    else:
+        # Legacy path: fresh ephemeral lease, apt prelude prepended every run
+        # (no-op when toolchain is empty).
+        test_command = tc.apply(test_command, toolchain)
+        cmd = ["crabbox", "run", "--provider", cfg.provider, "--"] + shlex.split(test_command)
     try:
         proc = subprocess.run(
             cmd,
@@ -277,6 +364,10 @@ def _cli() -> int:
     parser.add_argument("--reap", action="store_true",
                         help="stop orphaned leases for the provider before running "
                              "(prevents Apple VZ VM stacking from killed prior runs)")
+    parser.add_argument("--box-id", default=None,
+                        help="reusable crabbox box slug (from `crabbox warmup`); the "
+                             "toolchain is provisioned onto it once, then every run "
+                             "reuses it with no apt prelude (skips the per-round install)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -286,6 +377,8 @@ def _cli() -> int:
         overrides["provider"] = args.provider
     if args.timeout:
         overrides["timeout_seconds"] = args.timeout
+    if args.box_id:
+        overrides["box_id"] = args.box_id
     cfg = dataclasses.replace(cfg, **overrides)
 
     verdict = gate(workdir=args.workdir, test_command=args.test, config=cfg,

@@ -80,16 +80,27 @@ def resolve_packages(tools: Optional[Iterable[str]]) -> List[str]:
     return pkgs
 
 
+def prelude_for_packages(pkgs: Optional[Iterable[str]]) -> str:
+    """Return an apt-only `&&`-chain that installs an explicit apt package list.
+
+    Unlike build_prelude, the input is already-resolved apt package names (e.g.
+    the *missing* subset a warm box still needs). Empty -> empty string. Output
+    contains NO pipes, redirects, or shell builtins, so it is safe under the
+    Crabbox `run -- <argv>` contract.
+    """
+    pkgs = [p for p in (pkgs or []) if p]
+    if not pkgs:
+        return ""
+    return "sudo apt-get update -qq && sudo apt-get install -y -qq " + " ".join(pkgs)
+
+
 def build_prelude(tools: Optional[Iterable[str]]) -> str:
     """Return an apt-only `&&`-chain that installs the requested toolchain.
 
     Empty/None -> empty string. Output contains NO pipes, redirects, or shell
     builtins, so it is safe under the Crabbox `run -- <argv>` contract.
     """
-    pkgs = resolve_packages(tools)
-    if not pkgs:
-        return ""
-    return "sudo apt-get update -qq && sudo apt-get install -y -qq " + " ".join(pkgs)
+    return prelude_for_packages(resolve_packages(tools))
 
 
 def apply(test_command: str, tools: Optional[Iterable[str]]) -> str:
