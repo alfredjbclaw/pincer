@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.2.4 — 2026-07-01
+
+Learn from others' solutions, don't vanish exhausted issues, don't jointly
+saturate codex across loops, and stop paying the toolchain install on every
+fix-round. Hardening pass ahead of the first real greenfield build (Project
+Command Center).
+
+### New
+
+- **Prior-art harvester** (`tools/prior_art.py`, opt-in, default OFF). GitHub
+  code/repo search for a problem statement → rank top-N by repository **health**
+  (stars / recency / visible tests, not raw relevance) → fetch a few key files →
+  distill into a compact, **cited** pattern brief that feeds both the greenfield
+  planner (`fleet_build`) and the maintainer coder briefs. **Reference, not
+  transplant:** it extracts structure and approach with source attribution and
+  never emits license-encumbered source for copy-paste. Enable with
+  `[prior_art].enabled = true`; knobs for repo/file/search limits and cache dir.
+- **Terminal "needs human" escalation** (`tools/work_history.py`, `loop_spec`).
+  An issue that exhausts attempts / crosses the consecutive-failure threshold is
+  now marked **escalated**: `run_spec` surfaces `result=escalated` with the
+  issue ids and posts a loud "NEEDS HUMAN" alert, instead of silently cooling the
+  issue down forever. Clear with `work_history.clear_escalation(...)`.
+- **Cross-loop dispatch ceiling** (`tools/global_gate.py`). A shared, file-backed
+  global slot gate caps concurrent codex/VM dispatch **across independent loop
+  processes** — `mem_monitor` only guarded RAM per-host. Waits for a slot, then
+  defers the dispatch if the wait expires rather than bursting past the cap;
+  crashed holders are stale-reaped. Knobs: `global_max_concurrent`,
+  `global_gate_wait_seconds`, `global_gate_stale_seconds`.
+- **Warm-box toolchain reuse** (`tools/sandbox_gate.py`). Optional reusable
+  ("warm") crabbox box via `[sandbox].box_id` (or `PINCER_SANDBOX_BOX_ID`). The
+  language toolchain is provisioned onto it **once** (host-recorded in
+  `~/.openclaw/pincer/provisioned-boxes.json`), then every later fix-round runs
+  the **bare** test command on the reused box with no apt prelude — removing the
+  ~2m40s per-round toolchain reinstall that dominated multi-round builds. The
+  Crabbox argv contract forbids `||`/`command -v` guards, so the skip decision
+  lives host-side. Unset `box_id` keeps the legacy fresh-lease-per-run behavior.
+
+### Hardened
+
+- **Orphan-reap on the codex *error* path** (`tools/runtime_adapter.py`). Codex
+  lock reaping previously fired only on timeout / exception. A clean nonzero exit
+  (credit/auth/error) that falls back to Claude Code could still leave a stale
+  lock — the exact #8 wedge class. `_run_codex` now reaps on any nonzero exit and
+  on exhausted rate-limit retries, before the caller falls back.
+
 ## 0.2.3 — 2026-07-01
 
 Loop-reliability overhaul: the loop now learns from its own past attempts and
