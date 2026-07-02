@@ -12,7 +12,7 @@ Models: codex (gpt-5.5) for ALL coding; Opus orchestrates + checks (this driver
 + the fix-loop reviewer). ulw is off (the VM is the verifier, not the worker).
 """
 from __future__ import annotations
-import sys, json, subprocess, dataclasses
+import sys, os, json, subprocess, dataclasses
 import concurrent.futures as cf
 from pathlib import Path
 
@@ -135,7 +135,10 @@ def fix_round(failures, rnd):
 
 _PROJECT = Path(REPO).name
 try:
-    _THREAD = AlertThread(f"🏗️ {_PROJECT}") if AlertThread else None
+    # Route the build stream to a dedicated Telegram topic when requested
+    # (FLEET_ALERT_TOPIC), else the default Alerts topic (4).
+    _ALERT_TOPIC = int(os.environ.get("FLEET_ALERT_TOPIC", "4") or "4")
+    _THREAD = AlertThread(f"🏗️ {_PROJECT}", topic_id=_ALERT_TOPIC) if AlertThread else None
     alert(f"🏗️ FLEET BUILD START — building `{_PROJECT}` with {len(MODULES)} "
           "parallel codex builders against an Opus contract. We own the test env (no git/CI quirks).")
     state["phase"] = "build"; save()
