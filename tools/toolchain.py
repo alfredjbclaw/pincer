@@ -91,7 +91,13 @@ def prelude_for_packages(pkgs: Optional[Iterable[str]]) -> str:
     pkgs = [p for p in (pkgs or []) if p]
     if not pkgs:
         return ""
-    return "sudo apt-get update -qq && sudo apt-get install -y -qq " + " ".join(pkgs)
+    # Ubuntu's needrestart apt hook restarts services after installs — including
+    # crabbox-vsock-ssh-proxy.service, the very channel this command runs over.
+    # That kills the session mid-run (`remote command exited 255`) before the
+    # test command ever executes. Removing the hook file first (rm -f: exact
+    # path, no globs — argv contract has no shell globbing) disables it.
+    return ("sudo rm -f /etc/apt/apt.conf.d/99needrestart"
+            " && sudo apt-get update -qq && sudo apt-get install -y -qq " + " ".join(pkgs))
 
 
 def build_prelude(tools: Optional[Iterable[str]]) -> str:

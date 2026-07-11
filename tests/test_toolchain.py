@@ -34,7 +34,18 @@ def test_build_prelude_empty():
 
 def test_build_prelude_shape():
     p = tc.build_prelude(["node"])
-    assert p == "sudo apt-get update -qq && sudo apt-get install -y -qq nodejs npm"
+    assert p == ("sudo rm -f /etc/apt/apt.conf.d/99needrestart"
+                 " && sudo apt-get update -qq && sudo apt-get install -y -qq nodejs npm")
+
+
+def test_build_prelude_disables_needrestart_first():
+    # needrestart's apt hook restarts crabbox-vsock-ssh-proxy mid-install,
+    # killing the session (exit 255) before the test runs. The prelude must
+    # remove the hook BEFORE any apt-get runs.
+    p = tc.build_prelude(["python"])
+    rm_idx = p.index("rm -f /etc/apt/apt.conf.d/99needrestart")
+    apt_idx = p.index("apt-get update")
+    assert rm_idx < apt_idx
 
 
 def test_build_prelude_is_crabbox_argv_safe():
@@ -52,7 +63,8 @@ def test_apply_no_tools_is_passthrough():
 
 def test_apply_prepends_prelude():
     out = tc.apply("npm ci && npm test", ["node"])
-    assert out == ("sudo apt-get update -qq && sudo apt-get install -y -qq nodejs npm "
+    assert out == ("sudo rm -f /etc/apt/apt.conf.d/99needrestart"
+                   " && sudo apt-get update -qq && sudo apt-get install -y -qq nodejs npm "
                    "&& npm ci && npm test")
 
 

@@ -114,7 +114,10 @@ def vm_test():
         # Language-agnostic failure markers (Go, Node, Python, Rust, generic).
         markers = ("FAIL", "ok ", "Error", "error", "cannot", "undefined", "expected",
                    ".go:", "no test files", "PASS", "Traceback", "AssertionError",
-                   "npm ERR", "failing", "passing", "✓", "✗", "Tests:", "panicked")
+                   "npm ERR", "failing", "passing", "✓", "✗", "Tests:", "panicked",
+                   # infra-failure markers: a dropped VM session must reach the
+                   # fixer/orchestrator as itself, not as unexplained apt noise
+                   "remote command exited", "passed", "failed", "E: ")
         keep = [l for l in tail.splitlines()
                 if any(m in l for m in markers)
                 and "debconf" not in l and "crabbox" not in l]
