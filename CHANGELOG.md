@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.2.5 — 2026-07-13
+
+Sol leash: make Codex the durable builder for hard items instead of routing
+around it. Ported from the workspace sol-harness rework (same-day, live-tested
+there across an 18-item fleet).
+
+### New
+
+- **Resume retries** (`runtime_adapter.dispatch(attempt=, resume_thread=)`).
+  A retry resumes the SAME codex session by thread id (`codex exec resume`):
+  the worker keeps its repo exploration and its own diff, the retry prompt
+  carries only the new feedback, and cached input bills at ~10x less quota.
+  `RunResult.thread_id` exposes the handle; `stage_code` stores it and
+  `_revise_once` / `fleet_build.fix_round` resume it (with a fresh-dispatch
+  fallback when the resume path fails). A resumed call never vendor-falls-back
+  — the fallback runtime has none of the session context.
+  **Cage note:** `codex exec resume` has no `--cd`/`--sandbox` flags, so
+  sandbox/approvals/model are passed explicitly via `-c` on the resume path;
+  never rely on ambient `~/.codex/config.toml`.
+- **Effort ladder** (`codex_effort`, `effort_ladder` in `[runtime]`; CLI
+  `--effort`/`--attempt`). Attempt 1 at base (default medium), attempt 2 ≥high,
+  attempt 3+ ≥xhigh; `max` is never auto-selected. Effort is the direct
+  quota-burn dial (reasoning tokens are output tokens) — escalate with the
+  ladder, not by default.
+- **Empty-diff guard.** GPT-5.6's documented early-exit mode
+  (openai/codex#32162): `STATUS: done` with a clean git tree is downgraded to
+  `error` (`RunResult.empty_diff=True`) so strike/fallback/retry machinery
+  reacts; honest no-ops must report `no_changes`.
+- **SCOPE-REQUEST contract line.** Workers that need an out-of-scope change
+  report `NEXT: SCOPE-REQUEST: <path> -- <why>` instead of routing around the
+  cage; orchestrators can grant scope and resume.
+- **Operating-lessons injection.** `$PINCER_LESSONS` (default
+  `~/.openclaw/pincer/LESSONS.md`, bounded 4KB) is appended to the worker
+  contract — the recursive self-teaching channel. Keep it frozen mid-run
+  (resume cache prefix).
+- **Plugin kill-switches per dispatch** (`features.plugins=false`,
+  `features.plugin_hooks=false`): plugin daemons leaked ~2k orphan processes
+  and ~4x token overhead in an unattended fleet.
+
 ## 0.2.4 — 2026-07-01
 
 Learn from others' solutions, don't vanish exhausted issues, don't jointly

@@ -24,11 +24,11 @@ def test_error_exit_reaps_before_fallback(monkeypatch, tmp_path) -> None:
     calls = _spy_reap(monkeypatch)
     monkeypatch.setattr(
         runtime_adapter, "_codex_once",
-        lambda prompt, workdir, cfg: ("", "codex exec failed: credit_exhausted", 1),
+        lambda prompt, workdir, cfg, *a: ("", "codex exec failed: credit_exhausted", 1, None),
     )
 
     # When: the concurrency-capped runner returns the failure to the caller.
-    text, stderr, code = runtime_adapter._run_codex("task", tmp_path, runtime_adapter.RuntimeConfig())
+    text, stderr, code, _thread = runtime_adapter._run_codex("task", tmp_path, runtime_adapter.RuntimeConfig())
 
     # Then: the reaper fired on the error path so no lock lingers into the fallback.
     assert code == 1
@@ -40,7 +40,7 @@ def test_success_exit_does_not_reap(monkeypatch, tmp_path) -> None:
     calls = _spy_reap(monkeypatch)
     monkeypatch.setattr(
         runtime_adapter, "_codex_once",
-        lambda prompt, workdir, cfg: ("STATUS: done", "", 0),
+        lambda prompt, workdir, cfg, *a: ("STATUS: done", "", 0, None),
     )
 
     # When: the runner returns success.
@@ -56,11 +56,11 @@ def test_exhausted_rate_limit_retries_reap_before_fallback(monkeypatch, tmp_path
     monkeypatch.setattr(runtime_adapter.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
         runtime_adapter, "_codex_once",
-        lambda prompt, workdir, cfg: ("", "429 too many requests", 1),
+        lambda prompt, workdir, cfg, *a: ("", "429 too many requests", 1, None),
     )
 
     # When: the runner gives up after the retry budget.
-    text, stderr, code = runtime_adapter._run_codex("task", tmp_path, runtime_adapter.RuntimeConfig())
+    text, stderr, code, _thread = runtime_adapter._run_codex("task", tmp_path, runtime_adapter.RuntimeConfig())
 
     # Then: it reaps once before handing the caller the failure to fall back on.
     assert code == 1

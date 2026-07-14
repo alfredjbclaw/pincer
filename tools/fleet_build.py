@@ -127,13 +127,33 @@ def vm_test():
     except Exception:
         return "error", (err or out)[-800:]
 
+_fix_thread = {"id": None}  # last fix-round codex session, resumed by later rounds
+
+
 def fix_round(failures, rnd):
-    brief = (f"You are fixing a {LANG} project that fails its tests. SHARED CONTRACT:\n\n{CONTRACT}\n\n"
-             f"The full repo is in your working directory. The test command (`{TEST_CMD}`) FAILS with:\n\n"
-             f"{failures}\n\n"
-             "Fix the compile/test errors across whatever files are responsible so the WHOLE suite passes. "
-             "Keep the contract signatures/interfaces intact. Do NOT modify dependency manifests or lockfiles.")
-    res = ra.dispatch(brief, workdir=REPO, config=CFG)
+    resume = _fix_thread["id"]
+    if resume:
+        # Later rounds resume the prior fix session — it already knows the
+        # contract and the repo; send only the fresh failures. attempt=rnd+1
+        # climbs the effort ladder (round 1 = attempt 2 = high, ...).
+        brief = (f"The test command (`{TEST_CMD}`) STILL fails after your previous fix:\n\n"
+                 f"{failures}\n\n"
+                 "Fix the remaining compile/test errors so the WHOLE suite passes. Keep the "
+                 "contract signatures/interfaces intact. Do NOT modify dependency manifests "
+                 "or lockfiles. Leave changes uncommitted and finish with the same "
+                 "STATUS/FILES/VALIDATION/NEXT block.")
+    else:
+        brief = (f"You are fixing a {LANG} project that fails its tests. SHARED CONTRACT:\n\n{CONTRACT}\n\n"
+                 f"The full repo is in your working directory. The test command (`{TEST_CMD}`) FAILS with:\n\n"
+                 f"{failures}\n\n"
+                 "Fix the compile/test errors across whatever files are responsible so the WHOLE suite passes. "
+                 "Keep the contract signatures/interfaces intact. Do NOT modify dependency manifests or lockfiles.")
+    res = ra.dispatch(brief, workdir=REPO, config=CFG, attempt=rnd + 1, resume_thread=resume)
+    if resume and (res.exit_code != 0 or res.status == "error"):
+        # Dead/failed resume — fall back to one fresh full-context dispatch.
+        _fix_thread["id"] = None
+        return fix_round(failures, rnd)
+    _fix_thread["id"] = res.thread_id or _fix_thread["id"]
     return res.runtime
 
 _PROJECT = Path(REPO).name

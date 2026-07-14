@@ -83,7 +83,9 @@ def test_failure_context_is_injected_into_issue_and_revision_briefs(monkeypatch,
     monkeypatch.setattr(po.lz, "localize", lambda workdir, text: FakeHints())
     monkeypatch.setattr(po, "_failure_context", lambda repo, issue: context)
     monkeypatch.setattr(po.ra, "dispatch",
-                        lambda prompt, workdir, config: prompts.append(prompt) or SimpleNamespace(runtime="codex"))
+                        lambda prompt, workdir, config, **kw: prompts.append(prompt)
+                        or SimpleNamespace(runtime="codex", status="done",
+                                           exit_code=0, thread_id=None))
     monkeypatch.setattr(po, "_stage_changes", lambda wt: ["tools/foo.py"])
     monkeypatch.setattr(po, "sh", lambda *a, **k: ("", "", 0))
     monkeypatch.setattr(po, "_capture_patch", lambda wt, base_branch: "+fixed = True")
