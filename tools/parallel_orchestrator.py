@@ -452,7 +452,7 @@ def stage_code(repo: str, main_workdir: Path, base: Path, n: int, cfg, base_bran
     return {"issue": n, "sample": sample, "title": title, "worktree": str(wt),
             "branch": branch, "worker_status": res.status, "runtime": res.runtime,
             "fallback": res.fallback_used, "changed": changed, "committed": committed,
-            "patch": patch}
+            "patch": patch, "thread_id": res.thread_id}
 
 
 # --- Stage 2: sandbox (SERIAL via lock) ------------------------------------
@@ -527,11 +527,31 @@ def _revise_once(cand: dict, repo: str, base_branch: str, test_cmd: str, cfg,
     re-review, refresh the patch. Returns True iff the worker actually changed
     something (False == no-op: identical code, no point re-verifying)."""
     wt = cand["worktree"]
-    _, brief = issue_brief(repo, cand["issue"], workdir=cand["worktree"])
-    revision = (brief + "\n\n" + feedback
-                + "\nKeep the change minimal and narrow, and make sure the failing-first "
-                "test still proves the fix without breaking other tests.")
-    res = ra.dispatch(revision, workdir=wt, config=cfg)
+    thread = cand.get("thread_id")
+    if thread:
+        # Resume the original worker session: it already holds the issue brief
+        # and its own diff, so the revision sends only the feedback (cached
+        # input ~10x cheaper) and attempt 2 climbs the effort ladder.
+        revision = (feedback
+                    + "\nRevise your previous change accordingly. Keep the change "
+                    "minimal and narrow, and make sure the failing-first test still "
+                    "proves the fix without breaking other tests. Leave your changes "
+                    "uncommitted, and finish with the same STATUS/FILES/VALIDATION/"
+                    "NEXT block.")
+    else:
+        _, brief = issue_brief(repo, cand["issue"], workdir=cand["worktree"])
+        revision = (brief + "\n\n" + feedback
+                    + "\nKeep the change minimal and narrow, and make sure the failing-first "
+                    "test still proves the fix without breaking other tests.")
+    res = ra.dispatch(revision, workdir=wt, config=cfg, attempt=2, resume_thread=thread)
+    if thread and (res.exit_code != 0 or res.status == "error"):
+        # Resume path failed (dead session, quota, guard) — one fresh
+        # full-context dispatch preserves the old behavior.
+        _, brief = issue_brief(repo, cand["issue"], workdir=cand["worktree"])
+        revision = (brief + "\n\n" + feedback
+                    + "\nKeep the change minimal and narrow, and make sure the failing-first "
+                    "test still proves the fix without breaking other tests.")
+        res = ra.dispatch(revision, workdir=wt, config=cfg, attempt=2)
     cand["revise_runtime"] = res.runtime
     changed = _stage_changes(wt)
     if not changed:
