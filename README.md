@@ -169,7 +169,7 @@ Pincer deliberately avoids a single ambiguous activity log. The principal artifa
 |---|---|
 | `run-ledger.jsonl` | One classified outcome per loop run; drives infrastructure-failure auto-pause. |
 | `work-history.jsonl` | Per-issue attempt/outcome history, patch hashes, cooldowns, and escalation state. |
-| `dispatch-telemetry.jsonl` | One private attempt receipt and one outcome per model dispatch: runtime, model, effort, duration, token counters, retry/resume/fallback flags, and normalized failure class. Prompts and model text are never stored. |
+| `dispatch-telemetry.jsonl` | One private attempt receipt and one outcome per model dispatch: allowlisted runtime/model/effort, duration, token counters, retry/resume/fallback flags, and normalized failure class. Prompts and model text are never stored. |
 | `mem-samples.jsonl` | Host-memory samples used for concurrency and leak analysis. |
 | `logs/loop-driver.log` | Rotating driver decisions, watchdog events, and per-loop results. |
 | `run-logs/*.md` | Detailed stage-by-stage record for an individual run, retained to the most recent 50. |

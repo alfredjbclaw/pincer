@@ -28,6 +28,21 @@ from typing import Any, Optional
 TELEMETRY_DEFAULT = Path.home() / ".openclaw" / "pincer" / "dispatch-telemetry.jsonl"
 _SAFE_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,95}$")
 _SAFE_STATUSES = {"done", "no_changes", "blocked", "error", "interrupted"}
+_SAFE_RUNTIMES = {"codex", "claude-code"}
+_SAFE_EFFORTS = {"low", "medium", "high", "xhigh", "max", "unknown"}
+_SAFE_MODELS = {
+    "gpt-5.5",
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "o3",
+    "o4-mini",
+    "claude-opus-4-6",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+}
+_DISPATCH_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SAFE_FAILURE_CLASSES = {
     "none",
     "credit_exhausted",
@@ -79,6 +94,21 @@ def _label(value: object, default: str = "unknown") -> str:
 def _status(value: object) -> str:
     normalized = value.strip().lower() if isinstance(value, str) else ""
     return normalized if normalized in _SAFE_STATUSES else "unknown"
+
+
+def _runtime(value: object) -> str:
+    normalized = value.strip().lower() if isinstance(value, str) else ""
+    return normalized if normalized in _SAFE_RUNTIMES else "unknown"
+
+
+def _effort(value: object) -> str:
+    normalized = value.strip().lower() if isinstance(value, str) else ""
+    return normalized if normalized in _SAFE_EFFORTS else "unknown"
+
+
+def _model(value: object) -> str:
+    normalized = value.strip().lower() if isinstance(value, str) else ""
+    return normalized if normalized in _SAFE_MODELS else "unknown"
 
 
 def _failure_class(value: object) -> str:
@@ -249,9 +279,9 @@ def record_attempt(
             "dispatch_attempt": context["dispatch_attempt"],
             "transport_attempt": context["transport_attempt"],
             "resumed": context["resumed"],
-            "runtime": _label(runtime),
-            "model": _label(model),
-            "effort": _label(effort),
+            "runtime": _runtime(runtime),
+            "model": _model(model),
+            "effort": _effort(effort),
             "status": _status(status),
             "exit_code": int(exit_code),
             "duration_seconds": round(max(0.0, float(duration_seconds)), 3),
@@ -286,7 +316,7 @@ def record_outcome(
             "dispatch_attempt": context["dispatch_attempt"],
             "transport_attempts": context["transport_attempt"],
             "resumed": context["resumed"],
-            "runtime": _label(runtime),
+            "runtime": _runtime(runtime),
             "status": _status(status),
             "exit_code": int(exit_code),
             "duration_seconds": round(max(0.0, float(duration_seconds)), 3),
@@ -398,6 +428,13 @@ def summarize(records: list[dict]) -> dict:
         for record in attempts
         if record.get("failure_class") is not None
     ]
+    dispatch_attempts: Counter[str] = Counter()
+    for index, record in enumerate(attempts):
+        dispatch_id = record.get("dispatch_id")
+        key = dispatch_id if isinstance(dispatch_id, str) and _DISPATCH_ID_RE.fullmatch(
+            dispatch_id
+        ) else f"invalid:{index}"
+        dispatch_attempts[key] += 1
     return {
         "attempts": len(attempts),
         "outcomes": len(outcomes),
@@ -413,6 +450,13 @@ def summarize(records: list[dict]) -> dict:
         "resumed_outcomes": sum(record.get("resumed") is True for record in outcomes),
         "fallback_outcomes": sum(record.get("fallback_used") is True for record in outcomes),
         "empty_diff_outcomes": sum(record.get("empty_diff") is True for record in outcomes),
+        "retry_attempts": sum(max(0, count - 1) for count in dispatch_attempts.values()),
+        "retried_dispatches": sum(count > 1 for count in dispatch_attempts.values()),
+        "models": dict(sorted(Counter(_model(record.get("model")) for record in attempts).items())),
+        "runtimes": dict(sorted(Counter(
+            _runtime(record.get("runtime")) for record in attempts
+        ).items())),
+        "efforts": dict(sorted(Counter(_effort(record.get("effort")) for record in attempts).items())),
         "outcome_statuses": dict(
             sorted(Counter(_status(record.get("status")) for record in outcomes).items())
         ),

@@ -84,6 +84,33 @@ def test_attempt_and_outcome_receipts_are_private_and_summarizable(tmp_path, mon
     assert summary["cached_input_tokens"] == 150
     assert summary["cache_read_ratio"] == 0.75
     assert summary["resumed_outcomes"] == 1
+    assert summary["models"] == {"gpt-5.6-sol": 1}
+    assert summary["runtimes"] == {"codex": 1}
+    assert summary["efforts"] == {"high": 1}
+    assert summary["retry_attempts"] == 0
+    assert summary["retried_dispatches"] == 0
+
+
+def test_summary_reports_privacy_safe_models_and_transport_retries():
+    dispatch_id = "a" * 32
+    secret_like = "gh" + "p_" + ("a" * 36)
+    summary = dt.summarize([
+        {"kind": "attempt", "dispatch_id": dispatch_id, "runtime": "codex",
+         "model": "gpt-5.6-sol", "effort": "high", "failure_class": "rate_limit_429"},
+        {"kind": "attempt", "dispatch_id": dispatch_id, "runtime": secret_like,
+         "model": secret_like, "effort": secret_like, "failure_class": "none"},
+    ])
+    encoded = json.dumps(summary)
+
+    assert summary["retry_attempts"] == 1
+    assert summary["retried_dispatches"] == 1
+    assert summary["models"] == {"gpt-5.6-sol": 1, "unknown": 1}
+    assert summary["runtimes"] == {"codex": 1, "unknown": 1}
+    assert summary["efforts"] == {"high": 1, "unknown": 1}
+    assert secret_like not in encoded
+
+    prefixed_secret = "gpt-5-" + ("a" * 64)
+    assert dt._model(prefixed_secret) == "unknown"
 
 
 def test_pytest_never_writes_default_live_ledger(monkeypatch):
