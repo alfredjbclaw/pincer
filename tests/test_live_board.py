@@ -68,6 +68,37 @@ def test_run_log_writes_and_prunes(monkeypatch, tmp_path):
     assert len(list(d.glob("*.md"))) <= 51  # 50 kept + the new one
 
 
+def test_run_log_refuses_symlinked_directory_without_chmoding_target(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target = tmp_path / "shared-logs"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    parent = tmp_path / ".openclaw" / "pincer"
+    parent.mkdir(parents=True)
+    (parent / "run-logs").symlink_to(target, target_is_directory=True)
+    po._RUN_LOG = tmp_path / "stale.md"
+
+    po._start_run_log("owner/repo", "20260718-030000")
+
+    assert po._RUN_LOG is None
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert not list(target.iterdir())
+
+
+def test_run_log_allocates_unique_file_on_timestamp_collision(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    directory = tmp_path / ".openclaw" / "pincer" / "run-logs"
+    directory.mkdir(parents=True)
+    existing = directory / "20260718-030000-owner_repo.md"
+    existing.write_text("existing evidence")
+
+    po._start_run_log("owner/repo", "20260718-030000")
+
+    assert po._RUN_LOG == directory / "20260718-030000-owner_repo-1.md"
+    assert po._RUN_LOG.exists()
+    assert existing.read_text() == "existing evidence"
+
+
 # --- real backend behaviour (skips cleanly when telegram_alert absent) -----
 
 def test_liveboard_first_post_sends_rest_edit(monkeypatch):

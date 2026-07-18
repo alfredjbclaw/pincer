@@ -12,11 +12,15 @@ unit-tested without files; `record`/`read` are the only disk-touching parts.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
+import os
 from pathlib import Path
 from typing import List, Optional
 
 LEDGER_DEFAULT = Path.home() / ".openclaw" / "pincer" / "run-ledger.jsonl"
+LOG = logging.getLogger("pincer")
 
 
 def _ledger_path() -> Path:
@@ -24,8 +28,31 @@ def _ledger_path() -> Path:
     return Path(os.environ.get("PINCER_RUN_LEDGER", LEDGER_DEFAULT))
 
 
+def _prepare_parent(path: Path) -> None:
+    parent = path.parent
+    created = not parent.exists()
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if parent.is_symlink():
+        raise OSError(f"ledger parent is a symlink: {parent}")
+    if created or os.path.abspath(parent) == os.path.abspath(LEDGER_DEFAULT.parent):
+        os.chmod(parent, 0o700)
+
+
+def _fsync_parent(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path.parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def record(name: str, repo: str, result: str, scorecard: dict, ts: str,
-           path: Optional[Path] = None) -> None:
+           path: Optional[Path] = None) -> bool:
     """Append one run's outcome. `ts` is passed in (caller stamps) so this stays
     free of clock side-effects. Best-effort: never raises."""
     sc = scorecard or {}
@@ -39,11 +66,40 @@ def record(name: str, repo: str, result: str, scorecard: dict, ts: str,
     }
     p = path or _ledger_path()
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a") as f:
-            f.write(json.dumps(row) + "\n")
+        _prepare_parent(p)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(p, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            start_offset = os.lseek(fd, 0, os.SEEK_END)
+            payload = (json.dumps(row) + "\n").encode()
+            try:
+                while payload:
+                    written = os.write(fd, payload)
+                    if written <= 0:
+                        raise OSError("short write for run ledger")
+                    payload = payload[written:]
+                os.fsync(fd)
+            except BaseException:
+                try:
+                    os.ftruncate(fd, start_offset)
+                    os.fsync(fd)
+                except OSError:
+                    pass
+                raise
+            _fsync_parent(p)
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
     except Exception:
-        pass
+        LOG.exception("Failed to append run ledger at %s", p)
+        return False
+    return True
 
 
 def read(name: Optional[str] = None, path: Optional[Path] = None) -> List[dict]:
@@ -51,16 +107,26 @@ def read(name: Optional[str] = None, path: Optional[Path] = None) -> List[dict]:
     p = path or _ledger_path()
     rows: List[dict] = []
     try:
-        for line in Path(p).read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            r = json.loads(line)
-            if name is None or r.get("name") == name:
-                rows.append(r)
+        with Path(p).open(encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                for line_number, line in enumerate(handle, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except json.JSONDecodeError:
+                        LOG.warning("Skipping malformed run-ledger row %s in %s", line_number, p)
+                        continue
+                    if name is None or r.get("name") == name:
+                        rows.append(r)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except FileNotFoundError:
         return []
     except Exception:
+        LOG.exception("Failed to read run ledger at %s", p)
         return rows
     return rows
 

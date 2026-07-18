@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Observability
+
+- Added `tools/dispatch_telemetry.py`: one private attempt receipt and one
+  outcome per model dispatch, including model/runtime/effort, duration, token
+  counters, cache ratio inputs, retry/resume/fallback flags, empty-diff state,
+  and a normalized failure class. Prompts, model output, stderr, repository
+  paths, and session identifiers are deliberately excluded.
+- Added read-only `tools/pincer_diagnostics.py` for a bounded health snapshot of
+  the disabled/enabled driver state, configured loops, expected evidence,
+  failure streaks, dispatch usage, fleet state, and active gates.
+
+### Hardened
+
+- Run, work-history, and memory ledgers now use locked, fsynced, owner-only
+  writes and surface write/parse failures instead of silently discarding them.
+- Per-run logs are created owner-only. Driver-log tests now use an isolated
+  temporary destination so the live operational log is never polluted by
+  synthetic loop names or test ticks.
+
 ## 0.2.5 — 2026-07-13
 
 Sol leash: make Codex the durable builder for hard items instead of routing

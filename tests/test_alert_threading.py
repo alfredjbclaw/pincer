@@ -90,6 +90,8 @@ def test_loop_driver_threads_all_loops_under_one_root(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["loop_driver"])
     # Isolate from the real single-runner lock (a live driver may hold it).
     monkeypatch.setenv("PINCER_LOOP_LOCK", str(tmp_path / "test-driver.lock"))
+    # Never let a test tick contaminate the live operational driver log.
+    monkeypatch.setenv("PINCER_LOOP_LOG", str(tmp_path / "test-driver.log"))
     # Isolate the run-ledger/auto-pause hook from this threading test.
     monkeypatch.setattr(ld.run_ledger, "record", lambda *a, **k: None)
     monkeypatch.setattr(ld.run_ledger, "read", lambda *a, **k: [])

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import sys
 from pathlib import Path
 
@@ -69,3 +70,63 @@ def test_record_and_read_roundtrip(tmp_path, monkeypatch):
 def test_read_missing_file_is_empty(tmp_path, monkeypatch):
     monkeypatch.setenv("PINCER_RUN_LEDGER", str(tmp_path / "nope.jsonl"))
     assert rl.read("x") == []
+
+
+def test_record_does_not_chmod_existing_override_parent(tmp_path):
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    ledger = parent / "run.jsonl"
+
+    assert rl.record("loop", "owner/repo", "done", {}, "20260718", path=ledger)
+
+    assert parent.stat().st_mode & 0o777 == 0o755
+    assert ledger.stat().st_mode & 0o777 == 0o600
+
+
+def test_record_fsyncs_file_and_parent_directory(tmp_path, monkeypatch):
+    ledger = tmp_path / "run.jsonl"
+    real_fsync = rl.os.fsync
+    fsynced_modes = []
+
+    def observe_fsync(fd):
+        fsynced_modes.append(rl.os.fstat(fd).st_mode)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(rl.os, "fsync", observe_fsync)
+
+    assert rl.record("loop", "owner/repo", "done", {}, "20260718", path=ledger)
+    stat_module = __import__("stat")
+    assert any(stat_module.S_ISREG(mode) for mode in fsynced_modes)
+    assert any(stat_module.S_ISDIR(mode) for mode in fsynced_modes)
+
+
+def test_record_completes_short_os_writes(tmp_path, monkeypatch):
+    ledger = tmp_path / "run.jsonl"
+    real_write = rl.os.write
+
+    def short_write(fd, payload):
+        return real_write(fd, payload[: max(1, len(payload) // 2)])
+
+    monkeypatch.setattr(rl.os, "write", short_write)
+    assert rl.record("loop", "owner/repo", "done", {}, "20260718", path=ledger)
+    assert json.loads(ledger.read_text())["name"] == "loop"
+
+
+def test_record_rolls_back_partial_row_on_write_failure(tmp_path, monkeypatch):
+    ledger = tmp_path / "run.jsonl"
+    ledger.write_text('{"name":"existing"}\n')
+    original = ledger.read_bytes()
+    real_write = rl.os.write
+    calls = 0
+
+    def fail_after_partial(fd, payload):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(fd, payload[: max(1, len(payload) // 2)])
+        raise OSError("fixture write failure")
+
+    monkeypatch.setattr(rl.os, "write", fail_after_partial)
+    assert not rl.record("loop", "owner/repo", "done", {}, "20260718", path=ledger)
+    assert ledger.read_bytes() == original

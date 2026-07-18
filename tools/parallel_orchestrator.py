@@ -105,10 +105,53 @@ def _start_run_log(repo: str, ts: str) -> None:
     global _RUN_LOG
     try:
         d = Path.home() / ".openclaw" / "pincer" / "run-logs"
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if d.is_symlink():
+            raise OSError(f"run-log directory must not be a symlink: {d}")
+        dir_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            dir_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            dir_flags |= os.O_NOFOLLOW
+        dir_fd = os.open(d, dir_flags)
+        try:
+            os.fchmod(dir_fd, 0o700)
+        finally:
+            os.close(dir_fd)
         _prune_run_logs(d, keep=50)
-        _RUN_LOG = d / f"{ts}-{repo.replace('/', '_')}.md"
-        _RUN_LOG.write_text(f"# Pincer run — {repo} — {ts}\n\n")
+        stem = f"{ts}-{repo.replace('/', '_')}"
+        file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            file_flags |= os.O_NOFOLLOW
+        fd = None
+        run_log = d / f"{stem}.md"
+        for collision in range(1_000):
+            run_log = d / (f"{stem}.md" if collision == 0 else f"{stem}-{collision}.md")
+            try:
+                fd = os.open(run_log, file_flags, 0o600)
+                break
+            except FileExistsError:
+                continue
+        if fd is None:
+            raise OSError(f"unable to allocate unique run log under {d}")
+        try:
+            os.fchmod(fd, 0o600)
+            payload = f"# Pincer run — {repo} — {ts}\n\n".encode("utf-8")
+            while payload:
+                written = os.write(fd, payload)
+                if written <= 0:
+                    raise OSError("short write for Pincer run log")
+                payload = payload[written:]
+            os.fsync(fd)
+        except BaseException:
+            try:
+                run_log.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(fd)
+        _RUN_LOG = run_log
     except Exception:
         LOG.exception("Failed to start run log for %s", repo)
         _RUN_LOG = None

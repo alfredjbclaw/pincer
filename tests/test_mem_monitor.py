@@ -86,3 +86,97 @@ def test_log_sample_roundtrip_and_bounded(tmp_path, monkeypatch):
     assert len(rows) == 2
     assert rows[0]["event"] == "vm_start" and rows[0]["available_gb"] == 20.0
     assert rows[1]["event"] == "vm_end"
+
+
+def test_log_sample_does_not_chmod_existing_override_parent(tmp_path, monkeypatch):
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    ledger = parent / "mem.jsonl"
+    monkeypatch.setattr(mm, "available_gb", lambda *a, **k: 20.0)
+    monkeypatch.setattr(mm, "total_gb", lambda: 48.0)
+    monkeypatch.setattr(mm, "crabbox_vm_count", lambda *a, **k: 0)
+
+    assert mm.log_sample("vm_start", "20260718", path=ledger)
+
+    assert parent.stat().st_mode & 0o777 == 0o755
+    assert ledger.stat().st_mode & 0o777 == 0o600
+
+
+def test_log_sample_completes_short_writes(tmp_path, monkeypatch):
+    ledger = tmp_path / "mem.jsonl"
+    monkeypatch.setattr(mm, "sample", lambda: {"available_gb": 20.0})
+    real_write = mm.os.write
+
+    def short_write(fd, payload):
+        return real_write(fd, payload[: max(1, len(payload) // 2)])
+
+    monkeypatch.setattr(mm.os, "write", short_write)
+    assert mm.log_sample("vm_start", "20260718", path=ledger)
+    assert __import__("json").loads(ledger.read_text())["event"] == "vm_start"
+
+
+def test_log_sample_keeps_existing_ledger_when_rewrite_fails(tmp_path, monkeypatch):
+    ledger = tmp_path / "mem.jsonl"
+    ledger.write_text('{"event":"existing"}\n')
+    original = ledger.read_bytes()
+    real_write = mm.os.write
+    calls = 0
+
+    def fail_after_partial(fd, payload):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(fd, payload[: max(1, len(payload) // 2)])
+        raise OSError("fixture write failure")
+
+    monkeypatch.setattr(mm, "sample", lambda: {"available_gb": 20.0})
+    monkeypatch.setattr(mm.os, "write", fail_after_partial)
+    assert not mm.log_sample("vm_end", "20260718", path=ledger)
+    assert ledger.read_bytes() == original
+    assert list(tmp_path.glob(".mem.jsonl.*")) == [tmp_path / ".mem.jsonl.lock"]
+
+
+def test_log_sample_refuses_oversize_existing_ledger_without_modifying_it(tmp_path, monkeypatch):
+    ledger = tmp_path / "mem.jsonl"
+    ledger.write_bytes(b"x" * 64)
+    original = ledger.read_bytes()
+    monkeypatch.setattr(mm, "_SAMPLES_MAX_BYTES", 32)
+    monkeypatch.setattr(mm, "sample", lambda: {"available_gb": 20.0})
+
+    assert not mm.log_sample("vm_end", "20260718", path=ledger)
+    assert ledger.read_bytes() == original
+
+
+def test_log_sample_cleanup_failure_does_not_escape_after_commit(tmp_path, monkeypatch):
+    ledger = tmp_path / "mem.jsonl"
+    monkeypatch.setattr(mm, "sample", lambda: {"available_gb": 20.0})
+    real_flock = mm.fcntl.flock
+
+    def fail_unlock(fd, operation):
+        if operation == mm.fcntl.LOCK_UN:
+            raise OSError("fixture unlock failure")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(mm.fcntl, "flock", fail_unlock)
+
+    assert mm.log_sample("vm_start", "20260718", path=ledger)
+    assert __import__("json").loads(ledger.read_text())["event"] == "vm_start"
+
+
+def test_log_sample_fsyncs_file_and_parent_directory(tmp_path, monkeypatch):
+    ledger = tmp_path / "mem.jsonl"
+    monkeypatch.setattr(mm, "sample", lambda: {"available_gb": 20.0})
+    real_fsync = mm.os.fsync
+    fsynced_modes = []
+
+    def observe_fsync(fd):
+        fsynced_modes.append(mm.os.fstat(fd).st_mode)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(mm.os, "fsync", observe_fsync)
+
+    assert mm.log_sample("vm_start", "20260718", path=ledger)
+    stat_module = __import__("stat")
+    assert any(stat_module.S_ISREG(mode) for mode in fsynced_modes)
+    assert any(stat_module.S_ISDIR(mode) for mode in fsynced_modes)

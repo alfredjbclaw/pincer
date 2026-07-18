@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import logging
 import os
 import re
 import shutil
@@ -45,6 +46,9 @@ from pathlib import Path
 from typing import Final, Iterable, Optional
 
 import global_gate
+import dispatch_telemetry
+
+LOG = logging.getLogger("pincer.runtime")
 
 PINCER_CONFIG_DEFAULT = Path.home() / ".openclaw" / "pincer.toml"
 PINCER_STATE_DIR = Path.home() / ".openclaw" / "pincer"
@@ -355,12 +359,29 @@ def _run_codex(prompt: str, workdir: Path, cfg: RuntimeConfig,
     return result  # exhausted retries -> caller falls back to claude-code
 
 
+def _record_attempt_receipt(**fields) -> bool:
+    recorded = dispatch_telemetry.record_attempt(**fields)
+    if not recorded and dispatch_telemetry.enabled():
+        LOG.warning("Pincer dispatch attempt telemetry write failed")
+    return recorded
+
+
+def _record_outcome_receipt(**fields) -> bool:
+    recorded = dispatch_telemetry.record_outcome(**fields)
+    if not recorded and dispatch_telemetry.enabled():
+        LOG.warning("Pincer dispatch outcome telemetry write failed")
+    return recorded
+
+
 def _codex_once(prompt: str, workdir: Path, cfg: RuntimeConfig,
                 effort: Optional[str] = None,
                 resume_thread: Optional[str] = None) -> tuple[str, str, int, Optional[str]]:
+    started = time.monotonic()
     with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as last_msg_file:
         last_msg_path = Path(last_msg_file.name)
     proc: Optional[subprocess.Popen[str]] = None
+    stdout = ""
+    result: tuple[str, str, int, Optional[str]]
     # Config that must hold on EVERY dispatch: effort (the thinking dial) and
     # plugin kill-switches (plugin daemons leak processes and ~4x token
     # overhead in unattended fleets).
@@ -417,24 +438,60 @@ def _codex_once(prompt: str, workdir: Path, cfg: RuntimeConfig,
             returncode = proc.returncode if proc.returncode is not None else 1
         last_message = last_msg_path.read_text() if last_msg_path.exists() else ""
         thread_id = _parse_thread_id(stdout) or resume_thread
-        return (last_message or _final_from_jsonl(stdout) or stdout, stderr,
-                returncode, thread_id)
+        result = (last_message or _final_from_jsonl(stdout) or stdout, stderr,
+                  returncode, thread_id)
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
         _reap_codex_locks()
-        return ("", f"codex exec timed out after {cfg.timeout_seconds}s", 124, resume_thread)
+        result = ("", f"codex exec timed out after {cfg.timeout_seconds}s", 124, resume_thread)
     except Exception as exc:
         _kill_process_group(proc)
         _reap_codex_locks()
-        return ("", f"codex exec failed: {exc}", 1, resume_thread)
+        result = ("", f"codex exec failed: {exc}", 1, resume_thread)
     finally:
         last_msg_path.unlink(missing_ok=True)
+
+    final_text, stderr, exit_code, _thread_id = result
+    contract_status = _extract_contract(final_text)["status"] if final_text else "error"
+    trigger = _detect_fallback_trigger(stderr, final_text)
+    if exit_code == 124:
+        failure_class = "timeout"
+    elif trigger:
+        failure_class = trigger
+    elif exit_code != 0:
+        failure_class = "nonzero_exit"
+    elif contract_status not in SUCCESS_STATUSES:
+        failure_class = "contract_status"
+    else:
+        failure_class = "none"
+    _record_attempt_receipt(
+        runtime="codex",
+        model=cfg.codex_model,
+        effort=effort or cfg.codex_effort,
+        status=contract_status,
+        exit_code=exit_code,
+        duration_seconds=time.monotonic() - started,
+        failure_class=failure_class,
+        stdout=stdout,
+    )
+    return result
 
 
 def _run_claude_code(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[str, str, int]:
     """Invoke the workspace-local claude-code-wrapper.py, return (last_message, stderr, exit_code)."""
+    started = time.monotonic()
     if not CLAUDE_CODE_WRAPPER.exists():
-        return ("", f"claude-code wrapper not found at {CLAUDE_CODE_WRAPPER}", 127)
+        result = ("", f"claude-code wrapper not found at {CLAUDE_CODE_WRAPPER}", 127)
+        _record_attempt_receipt(
+            runtime="claude-code",
+            model=cfg.claude_model,
+            effort="unknown",
+            status="error",
+            exit_code=127,
+            duration_seconds=time.monotonic() - started,
+            failure_class="missing_runtime",
+        )
+        return result
     cmd = [
         "python3", str(CLAUDE_CODE_WRAPPER),
         "--workdir", str(workdir),
@@ -442,6 +499,8 @@ def _run_claude_code(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[st
         prompt + "\n\n" + worker_contract(),
     ]
     proc: Optional[subprocess.Popen[str]] = None
+    stdout = ""
+    result: tuple[str, str, int]
     try:
         if subprocess.run is not _SUBPROCESS_RUN:
             completed = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg.timeout_seconds)
@@ -461,15 +520,40 @@ def _run_claude_code(prompt: str, workdir: Path, cfg: RuntimeConfig) -> tuple[st
         # its `final_text`, not at the top level of stdout. Hand the contract
         # parser the final_text (else STATUS:/FILES: never match -> false error).
         text, exit_code = _unwrap_wrapper_output(stdout, returncode)
-        return (text, stderr, exit_code)
+        result = (text, stderr, exit_code)
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
         _reap_codex_locks()
-        return ("", f"claude-code wrapper timed out after {cfg.timeout_seconds}s", 124)
+        result = ("", f"claude-code wrapper timed out after {cfg.timeout_seconds}s", 124)
     except Exception as exc:
         _kill_process_group(proc)
         _reap_codex_locks()
-        return ("", f"claude-code wrapper failed: {exc}", 1)
+        result = ("", f"claude-code wrapper failed: {exc}", 1)
+
+    final_text, stderr, exit_code = result
+    contract_status = _extract_contract(final_text)["status"] if final_text else "error"
+    trigger = _detect_fallback_trigger(stderr, final_text)
+    if exit_code == 124:
+        failure_class = "timeout"
+    elif trigger:
+        failure_class = trigger
+    elif exit_code != 0:
+        failure_class = "nonzero_exit"
+    elif contract_status not in SUCCESS_STATUSES:
+        failure_class = "contract_status"
+    else:
+        failure_class = "none"
+    _record_attempt_receipt(
+        runtime="claude-code",
+        model=cfg.claude_model,
+        effort="unknown",
+        status=contract_status,
+        exit_code=exit_code,
+        duration_seconds=time.monotonic() - started,
+        failure_class=failure_class,
+        stdout=stdout,
+    )
+    return result
 
 
 def _unwrap_wrapper_output(stdout: str, returncode: int) -> tuple[str, int]:
@@ -564,6 +648,28 @@ def dispatch(
               if cfg.effort_ladder else cfg.codex_effort)
     resume_thread = resume_thread if cfg.primary == "codex" else None
     started = time.monotonic()
+    dispatch_telemetry.start_dispatch(
+        attempt=attempt,
+        resumed=resume_thread is not None,
+        workdir=workdir,
+    )
+    active_runtime = cfg.primary
+    fallback_attempted = False
+
+    def _finish(result: RunResult) -> RunResult:
+        try:
+            _record_outcome_receipt(
+                runtime=result.runtime,
+                status=result.status,
+                exit_code=result.exit_code,
+                duration_seconds=result.duration_seconds,
+                fallback_used=result.fallback_used,
+                fallback_reason=result.fallback_reason,
+                empty_diff=result.empty_diff,
+            )
+        finally:
+            dispatch_telemetry.clear_dispatch()
+        return result
 
     # Match the VM RAM gate's backpressure posture: wait for capacity instead of
     # over-dispatching. Unlike RAM, this is a hard global ceiling, so timeout
@@ -586,7 +692,7 @@ def dispatch(
 
             if (primary_ok or not cfg.fallback_enabled or cfg.primary == cfg.fallback
                     or resume_thread is not None):
-                return RunResult(
+                result = RunResult(
                     runtime=cfg.primary,
                     status=primary_contract["status"],
                     files=primary_contract["files"],
@@ -600,32 +706,37 @@ def dispatch(
                     thread_id=primary_thread,
                     empty_diff=primary_empty,
                 )
-
-            # Fallback decision: trigger detected, or hard error.
-            reason = trigger or (
-                "empty_diff" if primary_empty
-                else "nonzero_exit" if primary_exit != 0
-                else "blocked_status")
-            fb_text, fb_stderr, fb_exit, _fb_thread = _execute(
-                cfg.fallback, prompt, workdir, cfg, effort, None)
-            fb_contract = _extract_contract(fb_text)
-            fb_empty = _apply_empty_diff_guard(fb_contract, workdir)
-            return RunResult(
-                runtime=cfg.fallback,
-                status=fb_contract["status"],
-                files=fb_contract["files"],
-                validation=fb_contract["validation"],
-                next=fb_contract["next"],
-                final_text=fb_text,
-                fallback_used=True,
-                fallback_reason=reason,
-                duration_seconds=time.monotonic() - started,
-                exit_code=fb_exit,
-                thread_id=primary_thread,
-                empty_diff=fb_empty,
-            )
+            else:
+                # Fallback decision: trigger detected, or hard error.
+                reason = trigger or (
+                    "empty_diff" if primary_empty
+                    else "nonzero_exit" if primary_exit != 0
+                    else "blocked_status")
+                fallback_attempted = True
+                active_runtime = cfg.fallback
+                fb_text, fb_stderr, fb_exit, _fb_thread = _execute(
+                    cfg.fallback, prompt, workdir, cfg, effort, None)
+                fb_contract = _extract_contract(fb_text)
+                fb_empty = _apply_empty_diff_guard(fb_contract, workdir)
+                result = RunResult(
+                    runtime=cfg.fallback,
+                    status=fb_contract["status"],
+                    files=fb_contract["files"],
+                    validation=fb_contract["validation"],
+                    next=fb_contract["next"],
+                    final_text=fb_text,
+                    fallback_used=True,
+                    fallback_reason=reason,
+                    duration_seconds=time.monotonic() - started,
+                    exit_code=fb_exit,
+                    thread_id=primary_thread,
+                    empty_diff=fb_empty,
+                )
+        # Finalize only after the global gate has released successfully. A
+        # cleanup failure is a failed dispatch, not a successful receipt.
+        return _finish(result)
     except global_gate.GateTimeout as exc:
-        return RunResult(
+        return _finish(RunResult(
             runtime=cfg.primary,
             status="blocked",
             files=[],
@@ -636,7 +747,22 @@ def dispatch(
             fallback_reason="global_gate_timeout",
             duration_seconds=time.monotonic() - started,
             exit_code=75,
-        )
+        ))
+    except BaseException as exc:
+        try:
+            interrupted = isinstance(exc, (KeyboardInterrupt, SystemExit))
+            _record_outcome_receipt(
+                runtime=active_runtime,
+                status="interrupted" if interrupted else "error",
+                exit_code=130 if interrupted else 1,
+                duration_seconds=time.monotonic() - started,
+                fallback_used=fallback_attempted,
+                fallback_reason=f"exception:{type(exc).__name__}",
+                empty_diff=False,
+            )
+        finally:
+            dispatch_telemetry.clear_dispatch()
+        raise
 
 
 def _cli() -> int:

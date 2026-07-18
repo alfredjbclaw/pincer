@@ -22,14 +22,30 @@ and unit-tested via injected inputs.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
+import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 SAMPLES_DEFAULT = Path.home() / ".openclaw" / "pincer" / "mem-samples.jsonl"
 _SAMPLES_KEEP = 2000
+_SAMPLES_MAX_BYTES = 4_000_000
+LOG = logging.getLogger("pincer")
+
+
+def _prepare_parent(path: Path) -> None:
+    parent = path.parent
+    created = not parent.exists()
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if parent.is_symlink():
+        raise OSError(f"sample parent is a symlink: {parent}")
+    if created or os.path.abspath(parent) == os.path.abspath(SAMPLES_DEFAULT.parent):
+        os.chmod(parent, 0o700)
 
 
 def _vm_stat() -> str:
@@ -97,20 +113,95 @@ def sample(avail: Optional[float] = None, vm_count: Optional[int] = None) -> dic
             "vm_count": vm_count if vm_count is not None else crabbox_vm_count()}
 
 
-def log_sample(event: str, ts: str, path: Optional[Path] = None, **extra) -> None:
+def _write_all(fd: int, payload: bytes) -> None:
+    while payload:
+        written = os.write(fd, payload)
+        if written <= 0:
+            raise OSError("short write for memory sample")
+        payload = payload[written:]
+
+
+def log_sample(event: str, ts: str, path: Optional[Path] = None, **extra) -> bool:
     """Append one RAM sample (best-effort), keeping the file bounded for leak
     tracking. `ts` is passed in so this stays clock-free."""
     p = path or SAMPLES_DEFAULT
+    lock_fd: Optional[int] = None
+    temp_fd: Optional[int] = None
+    temp_path: Optional[str] = None
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_parent(p)
         row = {"ts": ts, "event": event, **sample(), **extra}
-        lines: List[str] = []
-        if p.exists():
-            lines = p.read_text().splitlines()
+        lock_path = p.with_name(f".{p.name}.lock")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        lock_fd = os.open(lock_path, flags, 0o600)
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        original = b""
+        try:
+            read_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                read_flags |= os.O_NOFOLLOW
+            source_fd = os.open(p, read_flags)
+        except FileNotFoundError:
+            pass
+        else:
+            with os.fdopen(source_fd, "rb") as source:
+                original = source.read(_SAMPLES_MAX_BYTES + 1)
+            if len(original) > _SAMPLES_MAX_BYTES:
+                raise OSError("memory sample ledger exceeds bounded rewrite size")
+
+        lines: List[str] = original.decode("utf-8").splitlines()
         lines.append(json.dumps(row))
-        p.write_text("\n".join(lines[-_SAMPLES_KEEP:]) + "\n")
+        payload = ("\n".join(lines[-_SAMPLES_KEEP:]) + "\n").encode("utf-8")
+
+        temp_fd, temp_path = tempfile.mkstemp(prefix=f".{p.name}.", dir=p.parent)
+        os.fchmod(temp_fd, 0o600)
+        _write_all(temp_fd, payload)
+        os.fsync(temp_fd)
+        os.close(temp_fd)
+        temp_fd = None
+        os.replace(temp_path, p)
+        temp_path = None
+        dir_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            dir_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            dir_flags |= os.O_NOFOLLOW
+        parent_fd = os.open(p.parent, dir_flags)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     except Exception:
-        pass
+        LOG.exception("Failed to write memory sample at %s", p)
+        return False
+    finally:
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                LOG.exception("Failed to remove temporary memory sample at %s", temp_path)
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                LOG.exception("Failed to unlock memory sample ledger at %s", p)
+            finally:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    LOG.exception("Failed to close memory sample lock at %s", p)
+    return True
 
 
 def detect_leak(samples: List[dict], drop_gb: float = 6.0) -> bool:

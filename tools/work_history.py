@@ -13,7 +13,10 @@ again without rewriting prior attempts.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -24,6 +27,7 @@ ESCALATED_OUTCOME = "escalated"
 CLEARED_OUTCOME = "cleared"
 RESET_OUTCOMES = {"shipped", CLEARED_OUTCOME}
 CONTROL_OUTCOMES = {ESCALATED_OUTCOME, CLEARED_OUTCOME}
+LOG = logging.getLogger("pincer")
 
 
 def _history_path() -> Path:
@@ -31,8 +35,69 @@ def _history_path() -> Path:
     return Path(os.environ.get("PINCER_WORK_HISTORY", HISTORY_DEFAULT))
 
 
+def _prepare_parent(path: Path) -> None:
+    parent = path.parent
+    created = not parent.exists()
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if parent.is_symlink():
+        raise OSError(f"history parent is a symlink: {parent}")
+    if created or os.path.abspath(parent) == os.path.abspath(HISTORY_DEFAULT.parent):
+        os.chmod(parent, 0o700)
+
+
+def _fsync_parent(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path.parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _append_row(row: dict, path: Path) -> bool:
+    try:
+        _prepare_parent(path)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            start_offset = os.lseek(fd, 0, os.SEEK_END)
+            payload = (json.dumps(row) + "\n").encode()
+            try:
+                while payload:
+                    written = os.write(fd, payload)
+                    if written <= 0:
+                        raise OSError("short write for work history")
+                    payload = payload[written:]
+                os.fsync(fd)
+            except BaseException:
+                try:
+                    os.ftruncate(fd, start_offset)
+                    os.fsync(fd)
+                except OSError:
+                    pass
+                raise
+            _fsync_parent(path)
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+    except Exception:
+        LOG.exception("Failed to append work history at %s", path)
+        return False
+    return True
+
+
 def record(repo, issue, run_id, runtime, patch_hash, sandbox, review, outcome,
-           reason, ts, path=None) -> None:
+           reason, ts, path=None) -> bool:
     row = {
         "repo": repo,
         "issue": issue,
@@ -45,32 +110,36 @@ def record(repo, issue, run_id, runtime, patch_hash, sandbox, review, outcome,
         "reason": reason,
         "ts": ts,
     }
-    p = path or _history_path()
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a") as f:
-            f.write(json.dumps(row) + "\n")
-    except Exception:
-        pass
+    return _append_row(row, path or _history_path())
 
 
 def read(repo=None, issue=None, path=None) -> List[dict]:
     p = path or _history_path()
     rows: List[dict] = []
     try:
-        for line in Path(p).read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if repo is not None and row.get("repo") != repo:
-                continue
-            if issue is not None and row.get("issue") != issue:
-                continue
-            rows.append(row)
+        with Path(p).open(encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                for line_number, line in enumerate(handle, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        LOG.warning("Skipping malformed work-history row %s in %s", line_number, p)
+                        continue
+                    if repo is not None and row.get("repo") != repo:
+                        continue
+                    if issue is not None and row.get("issue") != issue:
+                        continue
+                    rows.append(row)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except FileNotFoundError:
         return []
     except Exception:
+        LOG.exception("Failed to read work history at %s", p)
         return rows
     return rows
 
@@ -149,7 +218,7 @@ def should_escalate(rows, *, max_attempts=3,
     return False, "", failed_count
 
 
-def record_escalation(repo, issue, run_id, reason, attempts, ts, path=None) -> None:
+def record_escalation(repo, issue, run_id, reason, attempts, ts, path=None) -> bool:
     row = {
         "repo": repo,
         "issue": issue,
@@ -163,13 +232,7 @@ def record_escalation(repo, issue, run_id, reason, attempts, ts, path=None) -> N
         "attempts": attempts,
         "ts": ts,
     }
-    p = path or _history_path()
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a") as f:
-            f.write(json.dumps(row) + "\n")
-    except Exception:
-        pass
+    return _append_row(row, path or _history_path())
 
 
 def clear_escalation(repo, issue, run_id, reason, ts, path=None) -> None:

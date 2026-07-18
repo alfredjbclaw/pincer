@@ -162,3 +162,73 @@ def test_failure_context_summarizes_recent_failures():
 
 def test_failure_context_empty_when_no_rows():
     assert wh.failure_context([]) == ""
+
+
+def test_record_does_not_chmod_existing_override_parent(tmp_path):
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    history = parent / "work.jsonl"
+
+    assert wh.record("owner/repo", "13", "run", "codex", "a", "sandbox", "review",
+                     "failed", "fixture", NOW_TS, history)
+
+    assert parent.stat().st_mode & 0o777 == 0o755
+    assert history.stat().st_mode & 0o777 == 0o600
+
+
+def test_record_fsyncs_file_and_parent_directory(tmp_path, monkeypatch):
+    history = tmp_path / "work.jsonl"
+    real_fsync = wh.os.fsync
+    fsynced_modes = []
+
+    def observe_fsync(fd):
+        fsynced_modes.append(wh.os.fstat(fd).st_mode)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(wh.os, "fsync", observe_fsync)
+
+    assert wh.record(
+        "owner/repo", "13", "run", "codex", "a", "sandbox", "review",
+        "failed", "fixture", NOW_TS, history,
+    )
+    stat_module = __import__("stat")
+    assert any(stat_module.S_ISREG(mode) for mode in fsynced_modes)
+    assert any(stat_module.S_ISDIR(mode) for mode in fsynced_modes)
+
+
+def test_record_completes_short_os_writes(tmp_path, monkeypatch):
+    history = tmp_path / "work.jsonl"
+    real_write = wh.os.write
+
+    def short_write(fd, payload):
+        return real_write(fd, payload[: max(1, len(payload) // 2)])
+
+    monkeypatch.setattr(wh.os, "write", short_write)
+    assert wh.record(
+        "owner/repo", "13", "run", "codex", "a", "sandbox", "review",
+        "failed", "fixture", NOW_TS, history,
+    )
+    assert wh.read(path=history)[0]["repo"] == "owner/repo"
+
+
+def test_record_rolls_back_partial_row_on_write_failure(tmp_path, monkeypatch):
+    history = tmp_path / "work.jsonl"
+    history.write_text('{"repo":"existing"}\n')
+    original = history.read_bytes()
+    real_write = wh.os.write
+    calls = 0
+
+    def fail_after_partial(fd, payload):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(fd, payload[: max(1, len(payload) // 2)])
+        raise OSError("fixture write failure")
+
+    monkeypatch.setattr(wh.os, "write", fail_after_partial)
+    assert not wh.record(
+        "owner/repo", "13", "run", "codex", "a", "sandbox", "review",
+        "failed", "fixture", NOW_TS, history,
+    )
+    assert history.read_bytes() == original

@@ -1,8 +1,8 @@
 # 🦞 pincer
 
-![version](https://img.shields.io/badge/version-0.2.4-blue)
+![version](https://img.shields.io/badge/version-0.2.5-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![tests](https://img.shields.io/badge/tests-228-brightgreen)
+![tests](https://img.shields.io/badge/tests-pytest-brightgreen)
 ![python](https://img.shields.io/badge/python-3-blue)
 ![built for OpenClaw](https://img.shields.io/badge/built%20for-OpenClaw-e8632c)
 
@@ -35,13 +35,13 @@ Pincer's design starts from that distrust and builds outward. Three principles f
 
 1. **Plan and execute are different jobs, priced differently.** Deciding *what* to do is worth a frontier model called sparingly. Doing it is worth a mid-tier model called constantly. Collapsing the two is how you go broke or go dumb.
 2. **The model never grades its own homework.** Verification runs in a sandbox the worker doesn't control, on a suite the worker can't quietly edit around. The orchestrator reads a verdict, not a vibe.
-3. **Everything is a ledger.** Every decision, dispatch, sandbox verdict, and PR action is appended to an on-disk log. If Pincer did something, there's a line explaining why — the difference between an autonomous system and an unaccountable one.
+3. **Everything leaves structured evidence.** Run outcomes, issue attempts, dispatch cost, memory samples, driver decisions, and per-run stage logs are written to separate on-disk artifacts. If Pincer did something, the relevant subsystem leaves a bounded record explaining what happened — the difference between an autonomous system and an unaccountable one.
 
 ---
 
 ## Watch it work
 
-A single continuous run against a repo looks like this in the ledger (`~/.openclaw/pincer/log.md`):
+A single continuous run against a repo looks conceptually like this when the typed artifacts are joined:
 
 ```text
 09:00  MISSION   alfredjbclaw/pincer-testbed  → plan written (7 priorities, 3 autonomous)
@@ -83,7 +83,9 @@ $EDITOR ~/.openclaw/pincer.toml
 ```sh
 keeper audit owner/repo      # one-time pass: audit → plan → triage
 keeper run   owner/repo      # continuous orchestration (5-minute cadence)
-cat ~/.openclaw/pincer/log.md   # read the ledger
+python3 tools/pincer_diagnostics.py       # bounded system health snapshot
+python3 tools/dispatch_telemetry.py       # model/token/retry summary
+tail ~/.openclaw/pincer/logs/loop-driver.log
 ```
 
 `keeper` is the ergonomic front door — one command drives the whole Mission → Goal → Control pipeline against your configured repo allowlist.
@@ -147,7 +149,7 @@ Autonomy is only useful if it's bounded. Pincer's defaults assume it should neve
 - **Human-in-the-loop by default.** `allowMerge` and `allowRelease` are `false` out of the box — Pincer opens PRs, humans merge them. Turning either on is a deliberate per-repo choice, not a default you back into.
 - **Explicit repo allowlist.** Pincer only touches repositories you list in `[[repos]]`. There is no "discover and fix everything" mode.
 - **Sandboxed verification the worker can't tamper with.** Verdicts come from a clean VM running the repo's real suite — not from the model that wrote the diff.
-- **Every action is on the ledger.** Plans, triage decisions, dispatches, sandbox verdicts, and PR actions are appended to `~/.openclaw/pincer/log.md`. Nothing happens without a line explaining why.
+- **Typed, private observability.** Run outcomes, work attempts, dispatch usage, memory samples, driver ticks, and detailed run stages use separate artifacts under `~/.openclaw/pincer/`. Files are owner-only and diagnostics report bounded metadata instead of prompts or raw model output.
 - **Graceful degradation, not silent failure.** Runtime failover (Codex → Claude Code on credit-exhausted / auth-expired / three-strikes) and orphan-VM reaping are built in; a stuck run stops, it doesn't thrash.
 
 ## Benchmarking (and why Pincer never grades itself)
@@ -159,11 +161,26 @@ Pincer ships a separate SWE-bench harness (`tools/bench/`) that turns a run into
 
 The worker's own sandbox is never the grader. `preflight()` reports exactly which prerequisites are missing before any grade runs, and `run_lite` refuses to grade without Docker. Details in [BENCH.md](BENCH.md).
 
+## Observability
+
+Pincer deliberately avoids a single ambiguous activity log. The principal artifacts are:
+
+| Artifact | Purpose |
+|---|---|
+| `run-ledger.jsonl` | One classified outcome per loop run; drives infrastructure-failure auto-pause. |
+| `work-history.jsonl` | Per-issue attempt/outcome history, patch hashes, cooldowns, and escalation state. |
+| `dispatch-telemetry.jsonl` | One private attempt receipt and one outcome per model dispatch: runtime, model, effort, duration, token counters, retry/resume/fallback flags, and normalized failure class. Prompts and model text are never stored. |
+| `mem-samples.jsonl` | Host-memory samples used for concurrency and leak analysis. |
+| `logs/loop-driver.log` | Rotating driver decisions, watchdog events, and per-loop results. |
+| `run-logs/*.md` | Detailed stage-by-stage record for an individual run, retained to the most recent 50. |
+
+`python3 tools/pincer_diagnostics.py` provides a read-only, redacted health snapshot. It reports missing/stale evidence, aggregate failure streaks, dispatch cost and cache ratios, allowlisted fleet state, active gates, and whether the driver is loaded. Arbitrary persisted labels and identifiers are never emitted, and the command never enables a loop or changes state.
+
 ## What's under the hood
 
-- **228 tests** across 35 files — the orchestration logic, selection cascade, runtime adapters, and sandbox gate are all covered, not just smoke-tested.
-- **29 tool modules** — audit, preflight, sandbox gate, runtime adapter (Codex↔Claude Code failover), reproduction-test generation, selection cascade, publication gate, and the ledger.
-- **v0.2.4**, MIT-licensed, manifest-conformant OpenClaw skill bundle.
+- **Pytest suite** covering orchestration logic, selection cascade, runtime adapters, sandbox gate, diagnostics, and telemetry—not just smoke tests.
+- **28 tool modules** — audit, preflight, sandbox gate, runtime adapter (Codex↔Claude Code failover), reproduction-test generation, selection cascade, publication gate, and typed observability.
+- **v0.2.5**, MIT-licensed, manifest-conformant OpenClaw skill bundle.
 
 ---
 
