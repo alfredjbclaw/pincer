@@ -149,7 +149,7 @@ class RuntimeConfig:
     fallback: str = "claude-code"
     fallback_enabled: bool = True
     ultrawork: bool = True
-    codex_model: str = "gpt-5.5"
+    codex_model: str = "gpt-6.1-sol"
     claude_model: str = "claude-opus-5-5"
     codex_sandbox: str = "workspace-write"
     codex_effort: str = "medium"
@@ -175,7 +175,7 @@ class RuntimeConfig:
         data = tomllib.loads(cfg_path.read_text())
         rt = data.get("runtime", {})
         models = data.get("models", {})
-        agent_model = models.get("agent", "openai/gpt-5.5")
+        agent_model = models.get("agent", "openai/gpt-6.1-sol")
         codex_model = agent_model.split("/", 1)[-1] if "/" in agent_model else agent_model
         return cls(
             primary=rt.get("primary", "codex"),

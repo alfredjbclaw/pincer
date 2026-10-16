@@ -8,7 +8,7 @@ and run a bounded fix-loop on any failures. The "recreate from scratch with a
 fleet" mode — sidesteps real-repo env quirks and tests construction, not just
 bug-fixing.
 
-Models: codex (gpt-5.5) for ALL coding; Opus orchestrates + checks (this driver
+Models: codex (gpt-6.1-sol) for ALL coding; Opus orchestrates + checks (this driver
 + the fix-loop reviewer). ulw is off (the VM is the verifier, not the worker).
 """
 from __future__ import annotations
