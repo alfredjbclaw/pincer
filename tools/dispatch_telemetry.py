@@ -35,12 +35,21 @@ _SAFE_MODELS = {
     "gpt-5.6",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-6-luna",
+    "gpt-6-astra",
     "o3",
     "o4-mini",
     "claude-opus-4-6",
     "claude-opus-4-8",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
+    "claude-opus-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
 }
 _DISPATCH_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SAFE_FAILURE_CLASSES = {

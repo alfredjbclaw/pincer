@@ -127,7 +127,7 @@ def generate(
     repo_workdir: str,
     *,
     hint_block: str = "",
-    model: str = "claude-opus-4-8",
+    model: str = "claude-opus-5-5",
     timeout: int = 600,
     path: str = DEFAULT_PATH,
     _runner: Optional[Callable[[str, str, str, int], str]] = None,

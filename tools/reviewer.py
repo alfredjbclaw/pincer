@@ -47,7 +47,7 @@ def review(
     criteria: str,
     *,
     repo_workdir: str | None = None,
-    model: str = "claude-opus-4-8",
+    model: str = "claude-opus-5-5",
     mcp_config_path: str | None = None,
     timeout: int = 900,
 ) -> ReviewVerdict:
@@ -99,7 +99,7 @@ def interpret_failure(
     issue: str,
     *,
     repo_workdir: str | None = None,
-    model: str = "claude-opus-4-8",
+    model: str = "claude-opus-5-5",
     timeout: int = 300,
     _runner=None,
 ) -> str | None:

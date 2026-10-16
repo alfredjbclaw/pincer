@@ -150,7 +150,7 @@ class RuntimeConfig:
     fallback_enabled: bool = True
     ultrawork: bool = True
     codex_model: str = "gpt-5.5"
-    claude_model: str = "claude-opus-4-6"
+    claude_model: str = "claude-opus-5-5"
     codex_sandbox: str = "workspace-write"
     codex_effort: str = "medium"
     effort_ladder: bool = True

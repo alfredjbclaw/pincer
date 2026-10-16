@@ -751,7 +751,7 @@ class SelectionTuning:
     max_revise_iters: int = 1     # bounded execution-feedback loop depth
     repro_tests: bool = False     # generate + F->P-filter reproduction tests
     interpret_failures: bool = True
-    repro_model: str = "claude-opus-4-8"
+    repro_model: str = "claude-opus-5-5"
 
     @classmethod
     def load(cls, path=None):
@@ -779,7 +779,7 @@ class SelectionTuning:
             max_revise_iters=int(s.get("max_revise_iters", 1)),
             repro_tests=bool(s.get("repro_tests", False)),
             interpret_failures=bool(s.get("interpret_failures", True)),
-            repro_model=str(s.get("repro_model", "claude-opus-4-8")),
+            repro_model=str(s.get("repro_model", "claude-opus-5-5")),
         )
 
 
